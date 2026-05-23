@@ -8,6 +8,7 @@ const STATUS_STYLES: Record<string, string> = {
   PAYROLL_READY: 'bg-green-100 text-green-700',
   FAILED: 'bg-red-100 text-red-700',
   COMPLETED: 'bg-green-100 text-green-700',
+  CANCELLED: 'bg-gray-300 text-gray-600',
   // File statuses
   DETECTED: 'bg-gray-100 text-gray-600',
   PARSED: 'bg-blue-100 text-blue-700',

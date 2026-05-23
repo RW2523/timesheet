@@ -57,8 +57,10 @@ async def upload_zip(
     db.add(batch)
     db.commit()
 
-    # Enqueue Celery task
-    process_batch.delay(batch_id)
+    # Enqueue Celery task and persist task_id for later cancellation
+    task = process_batch.delay(batch_id)
+    batch.summary_json = {**(batch.summary_json or {}), "celery_task_id": task.id}
+    db.commit()
 
     return {
         "batch_id": batch_id,

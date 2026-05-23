@@ -1,13 +1,31 @@
 'use client'
-import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Link from 'next/link'
-import { listBatches } from '@/lib/api'
+import { listBatches, cancelBatch } from '@/lib/api'
 import StatusBadge from '@/components/ui/StatusBadge'
-import { FolderOpen, Upload } from 'lucide-react'
+import { FolderOpen, Upload, StopCircle, Loader2 } from 'lucide-react'
 import { formatDistanceToNow } from 'date-fns'
 
+const ACTIVE_STATUSES = ['UPLOADED', 'PROCESSING']
+
 export default function BatchesPage() {
-  const { data, isLoading } = useQuery({ queryKey: ['batches'], queryFn: () => listBatches({ limit: 50 }), refetchInterval: 8000 })
+  const qc = useQueryClient()
+  const [confirmId, setConfirmId] = useState<string | null>(null)
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['batches'],
+    queryFn: () => listBatches({ limit: 50 }),
+    refetchInterval: 6000,
+  })
+
+  const cancelMut = useMutation({
+    mutationFn: (id: string) => cancelBatch(id),
+    onSuccess: () => {
+      setConfirmId(null)
+      qc.invalidateQueries({ queryKey: ['batches'] })
+    },
+  })
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
@@ -42,25 +60,62 @@ export default function BatchesPage() {
                 <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Files</th>
                 <th className="text-right px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Ready</th>
                 <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Uploaded</th>
+                <th className="px-6 py-3"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {data?.items?.map((b) => (
-                <tr key={b.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4">
-                    <Link href={`/batches/${b.id}`} className="font-medium text-blue-600 hover:underline">
-                      {b.source_name}
-                    </Link>
-                    <p className="text-xs text-gray-400">{b.id.slice(0, 8)}…</p>
-                  </td>
-                  <td className="px-6 py-4"><StatusBadge status={b.status} /></td>
-                  <td className="px-6 py-4 text-right text-gray-700">{b.total_files}</td>
-                  <td className="px-6 py-4 text-right text-green-600 font-medium">{b.payroll_ready_count}</td>
-                  <td className="px-6 py-4 text-gray-500 text-xs">
-                    {formatDistanceToNow(new Date(b.created_at), { addSuffix: true })}
-                  </td>
-                </tr>
-              ))}
+              {data?.items?.map((b) => {
+                const isActive = ACTIVE_STATUSES.includes(b.status)
+                return (
+                  <tr key={b.id} className="hover:bg-gray-50">
+                    <td className="px-6 py-4">
+                      <Link href={`/batches/${b.id}`} className="font-medium text-blue-600 hover:underline">
+                        {b.source_name}
+                      </Link>
+                      <p className="text-xs text-gray-400">{b.id.slice(0, 8)}…</p>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center gap-2">
+                        {isActive && <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin shrink-0" />}
+                        <StatusBadge status={b.status} />
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 text-right text-gray-700">{b.total_files}</td>
+                    <td className="px-6 py-4 text-right text-green-600 font-medium">{b.payroll_ready_count}</td>
+                    <td className="px-6 py-4 text-gray-500 text-xs">
+                      {formatDistanceToNow(new Date(b.created_at), { addSuffix: true })}
+                    </td>
+                    <td className="px-6 py-4 text-right">
+                      {isActive && (
+                        confirmId === b.id ? (
+                          <div className="flex items-center gap-2 justify-end">
+                            <span className="text-xs text-red-600">Cancel?</span>
+                            <button
+                              onClick={() => cancelMut.mutate(b.id)}
+                              disabled={cancelMut.isPending}
+                              className="text-xs bg-red-600 text-white px-2 py-1 rounded hover:bg-red-700 disabled:opacity-50"
+                            >
+                              {cancelMut.isPending ? '…' : 'Yes'}
+                            </button>
+                            <button onClick={() => setConfirmId(null)} className="text-xs text-gray-400 hover:text-gray-600">
+                              No
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmId(b.id)}
+                            title="Stop processing"
+                            className="inline-flex items-center gap-1 text-xs text-red-500 hover:text-red-700 px-2 py-1 rounded hover:bg-red-50 transition-colors"
+                          >
+                            <StopCircle className="w-3.5 h-3.5" />
+                            Stop
+                          </button>
+                        )
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         )}

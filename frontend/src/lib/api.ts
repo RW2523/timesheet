@@ -32,6 +32,24 @@ export const getBatch = async (batchId: string): Promise<BatchSummary> => {
   return data
 }
 
+export const cancelBatch = async (batchId: string) => {
+  const { data } = await http.post(`/batches/${batchId}/cancel`)
+  return data
+}
+
+export const getBatchStatus = async (batchId: string) => {
+  const { data } = await http.get(`/batches/${batchId}/status`)
+  return data as {
+    batch_id: string
+    status: string
+    total_files: number
+    done_files: number
+    failed_files: number
+    review_files: number
+    progress_pct: number
+  }
+}
+
 // ── Upload ────────────────────────────────────────────────────────────────────
 
 export const uploadZip = async (
