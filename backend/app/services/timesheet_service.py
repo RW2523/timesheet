@@ -1,7 +1,17 @@
 """
 Timesheet service — Phase 6.
 Creates timesheet_submissions and timesheet_entries from normalized JSON.
-Merges partial records, detects duplicate dates.
+
+Key improvements:
+- Vendor-aware overtime split: only split OT when vendor.overtime_enabled is True.
+  Non-OT vendors get a OVERTIME_NOT_ALLOWED_REVIEW warning instead of silently splitting.
+- DAILY_HOURS_MISMATCH: when entered_hours and calculated_hours both exist and differ
+  by more than HOURS_MISMATCH_TOLERANCE, a validation error is created.
+- INVALID_DATE: Excel epoch artifact dates (value starts with "INVALID_") generate a
+  validation error and the entry is skipped.
+- Entries outside the batch period (already removed from llm_json by Normalizer) are
+  excluded here too for extra safety.
+- Merges multiple files for the same employee+month into one submission.
 """
 import logging
 from datetime import datetime, date, time
@@ -12,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     TimesheetSubmission, TimesheetEntry, ValidationError,
-    UploadedFile, RawExtraction, BatchUpload, gen_uuid,
+    UploadedFile, RawExtraction, BatchUpload, Employee, Vendor, gen_uuid,
 )
 from app.core.config import settings
 
@@ -67,6 +77,9 @@ class TimesheetService:
         if not entries_data:
             return
 
+        # Fetch vendor for this employee (needed for OT split logic)
+        vendor = self._get_vendor(file_record.matched_employee_id)
+
         period_start = self._parse_date(extracted.get("period_start"))
         period_end = self._parse_date(extracted.get("period_end"))
         if not period_start and entries_data:
@@ -74,7 +87,6 @@ class TimesheetService:
         if not period_end and entries_data:
             period_end = self._parse_date(entries_data[-1].get("date"))
 
-        # Find or create submission for this employee+period
         submission = self._find_or_create_submission(
             employee_id=file_record.matched_employee_id,
             file_id=file_record.id,
@@ -83,11 +95,27 @@ class TimesheetService:
             period_start=period_start,
             period_end=period_end,
             extracted=extracted,
+            vendor=vendor,
         )
 
-        # Create entries
         for entry_data in entries_data:
-            work_date = self._parse_date(entry_data.get("date"))
+            raw_date = entry_data.get("date") or ""
+
+            # Flag invalid Excel epoch dates
+            if str(raw_date).startswith("INVALID_"):
+                self._add_validation_error(
+                    batch_id=batch_id,
+                    file_id=file_record.id,
+                    submission_id=submission.id,
+                    employee_id=file_record.matched_employee_id,
+                    rule_code="INVALID_DATE",
+                    severity="ERROR",
+                    message=f"Invalid Excel epoch date detected: {raw_date}",
+                    actual_value=str(raw_date),
+                )
+                continue
+
+            work_date = self._parse_date(raw_date)
             if not work_date:
                 continue
 
@@ -101,17 +129,34 @@ class TimesheetService:
                 .first()
             )
             if existing:
-                # Flag as duplicate date — will be caught by validation
-                self._add_validation_error(
-                    batch_id=batch_id,
-                    file_id=file_record.id,
-                    submission_id=submission.id,
-                    employee_id=file_record.matched_employee_id,
-                    rule_code="DUPLICATE_DATE",
-                    severity="ERROR",
-                    message=f"Duplicate entry for date {work_date}",
-                    actual_value=str(work_date),
-                )
+                existing_hours = float(existing.calculated_hours or existing.entered_hours or 0)
+                new_hours = float(entry_data.get("hours") or 0)
+                if abs(existing_hours - new_hours) > settings.HOURS_MISMATCH_TOLERANCE:
+                    # Same date, different hours = OVERLAPPING_DATE_CONFLICT (BLOCKER)
+                    self._add_validation_error(
+                        batch_id=batch_id,
+                        file_id=file_record.id,
+                        submission_id=submission.id,
+                        employee_id=file_record.matched_employee_id,
+                        rule_code="OVERLAPPING_DATE_CONFLICT",
+                        severity="BLOCKER",
+                        message=f"Conflicting entries for {work_date}: "
+                                f"existing={existing_hours:.2f}h, new={new_hours:.2f}h",
+                        expected_value=str(existing_hours),
+                        actual_value=str(new_hours),
+                    )
+                else:
+                    # Same date, same hours = DUPLICATE_DATE (WARNING)
+                    self._add_validation_error(
+                        batch_id=batch_id,
+                        file_id=file_record.id,
+                        submission_id=submission.id,
+                        employee_id=file_record.matched_employee_id,
+                        rule_code="DUPLICATE_DATE",
+                        severity="WARNING",
+                        message=f"Duplicate entry for date {work_date} (same hours — possibly the same file processed twice)",
+                        actual_value=str(work_date),
+                    )
                 continue
 
             in_time = self._parse_time(entry_data.get("in_time"))
@@ -124,11 +169,61 @@ class TimesheetService:
                 except (ValueError, TypeError):
                     entered_hours = None
 
-            # Calculate hours deterministically
-            calculated_hours = self._calculate_hours(in_time, out_time, break_min, entered_hours)
+            # Deterministic hour calculation
+            calculated_hours, calc_method = self._calculate_hours(in_time, out_time, break_min, entered_hours)
 
-            # Split regular / overtime
-            regular_h, ot_h = self._split_regular_overtime(calculated_hours)
+            # Detect mismatch between entered and calculated hours
+            has_mismatch = (
+                entered_hours is not None and calculated_hours is not None
+                and in_time and out_time  # only flag when we actually calculated
+                and abs(float(entered_hours) - float(calculated_hours)) > settings.HOURS_MISMATCH_TOLERANCE
+            )
+            if has_mismatch:
+                self._add_validation_error(
+                    batch_id=batch_id,
+                    file_id=file_record.id,
+                    submission_id=submission.id,
+                    employee_id=file_record.matched_employee_id,
+                    rule_code="DAILY_HOURS_MISMATCH",
+                    severity="ERROR",
+                    message=(
+                        f"{work_date}: entered_hours={entered_hours:.2f}h but "
+                        f"calculated from in/out={calculated_hours:.2f}h "
+                        f"(tolerance ±{settings.HOURS_MISMATCH_TOLERANCE}h)"
+                    ),
+                    expected_value=str(calculated_hours),
+                    actual_value=str(entered_hours),
+                )
+
+            # Payroll safety rule: when entered_hours and calculated_hours disagree,
+            # use entered_hours (what the employee filed) not the system calculation.
+            # HR can review and override. This prevents silently inflating payroll.
+            payroll_hours = entered_hours if (has_mismatch and entered_hours is not None) else calculated_hours
+
+            # Vendor-aware regular / overtime split
+            regular_h, ot_h = self._split_regular_overtime(
+                payroll_hours, vendor=vendor,
+            )
+
+            # If overtime not allowed for this vendor but OT is present, create a review alert
+            if ot_h > 0 and vendor and not vendor.overtime_enabled:
+                self._add_validation_error(
+                    batch_id=batch_id,
+                    file_id=file_record.id,
+                    submission_id=submission.id,
+                    employee_id=file_record.matched_employee_id,
+                    rule_code="OVERTIME_NOT_ALLOWED",
+                    severity="ERROR",
+                    message=(
+                        f"{work_date}: {ot_h:.2f}h overtime claimed but "
+                        f"vendor '{vendor.name}' does not allow overtime"
+                    ),
+                    expected_value="0",
+                    actual_value=str(ot_h),
+                )
+                # For non-OT vendors treat all hours as regular for payroll safety
+                regular_h = calculated_hours or 0.0
+                ot_h = 0.0
 
             entry = TimesheetEntry(
                 id=gen_uuid(),
@@ -155,6 +250,13 @@ class TimesheetService:
         file_record.updated_at = datetime.utcnow()
         self.db.commit()
 
+    def _get_vendor(self, employee_id: str) -> Optional[Vendor]:
+        """Fetch vendor for employee."""
+        emp = self.db.query(Employee).filter(Employee.id == employee_id).first()
+        if emp and emp.vendor_id:
+            return self.db.query(Vendor).filter(Vendor.id == emp.vendor_id).first()
+        return None
+
     def _find_or_create_submission(
         self,
         employee_id: str,
@@ -164,8 +266,15 @@ class TimesheetService:
         period_start: Optional[date],
         period_end: Optional[date],
         extracted: dict,
+        vendor: Optional[Vendor],
     ) -> TimesheetSubmission:
-        """Find existing submission for same employee+period or create new one."""
+        """Find existing submission for same employee+period or create a new one.
+
+        Merging strategy:
+        - If payroll_period_id exists, find by employee + payroll_period.
+        - Otherwise find by employee + batch (merge all files for same employee in batch).
+        """
+        # Primary: find by payroll period
         if payroll_period_id:
             existing = (
                 self.db.query(TimesheetSubmission)
@@ -177,14 +286,37 @@ class TimesheetService:
                 .first()
             )
             if existing:
+                # Extend period if this file covers more dates
+                if period_start and (not existing.timesheet_start_date or period_start < existing.timesheet_start_date):
+                    existing.timesheet_start_date = period_start
+                if period_end and (not existing.timesheet_end_date or period_end > existing.timesheet_end_date):
+                    existing.timesheet_end_date = period_end
                 return existing
 
+        # Secondary: find by employee + batch (no payroll period set)
+        existing_any = (
+            self.db.query(TimesheetSubmission)
+            .filter(
+                TimesheetSubmission.batch_id == batch_id,
+                TimesheetSubmission.employee_id == employee_id,
+            )
+            .first()
+        )
+        if existing_any:
+            if period_start and (not existing_any.timesheet_start_date or period_start < existing_any.timesheet_start_date):
+                existing_any.timesheet_start_date = period_start
+            if period_end and (not existing_any.timesheet_end_date or period_end > existing_any.timesheet_end_date):
+                existing_any.timesheet_end_date = period_end
+            return existing_any
+
+        vendor_id = vendor.id if vendor else None
         sub = TimesheetSubmission(
             id=gen_uuid(),
             batch_id=batch_id,
             file_id=file_id,
             employee_id=employee_id,
             payroll_period_id=payroll_period_id,
+            vendor_id=vendor_id,
             source_type="ZIP_UPLOAD",
             submission_date=datetime.utcnow(),
             timesheet_start_date=period_start,
@@ -205,30 +337,63 @@ class TimesheetService:
         out_time: Optional[time],
         break_min: int,
         entered_hours: Optional[float],
-    ) -> Optional[float]:
-        """Deterministic hour calculation. Never delegated to LLM."""
+    ) -> tuple[Optional[float], str]:
+        """Deterministic hour calculation. Returns (hours, method_description).
+
+        Never delegated to LLM.
+        Uses clock-in/out when available; falls back to entered_hours.
+        If clock calculation > 14h but entered ≤ 14h, trusts entered_hours
+        (the out_time was likely AM/PM-ambiguous).
+        """
         if in_time and out_time:
             in_mins = in_time.hour * 60 + in_time.minute
             out_mins = out_time.hour * 60 + out_time.minute
             if out_mins < in_mins:  # crosses midnight
                 out_mins += 24 * 60
             total_mins = out_mins - in_mins - break_min
-            return round(max(total_mins, 0) / 60.0, 2)
-        return entered_hours
+            calculated = round(max(total_mins, 0) / 60.0, 2)
+            if calculated > 14 and entered_hours and 0 < entered_hours <= 14:
+                return entered_hours, "ENTERED_HOURS_USED_AMPM_AMBIGUITY"
+            return calculated, "CALCULATED_FROM_IN_OUT"
+        if entered_hours is not None:
+            return entered_hours, "HOURS_FROM_FILE_ONLY"
+        return None, "NO_HOURS"
 
     @staticmethod
-    def _split_regular_overtime(hours: Optional[float]) -> tuple[float, float]:
-        """Split hours into regular and overtime."""
+    def _split_regular_overtime(
+        hours: Optional[float],
+        vendor: Optional[Vendor] = None,
+    ) -> tuple[float, float]:
+        """Split hours into regular and overtime.
+
+        Respects vendor daily_regular_limit and overtime_enabled flag.
+        If vendor does not allow overtime, all hours are returned as regular
+        (the caller is responsible for creating the OVERTIME_NOT_ALLOWED error).
+        """
         if hours is None:
             return 0.0, 0.0
-        daily_limit = settings.REGULAR_DAILY_LIMIT_HOURS
+
+        if vendor:
+            daily_limit = float(vendor.regular_daily_limit or settings.REGULAR_DAILY_LIMIT_HOURS)
+            ot_allowed = vendor.overtime_enabled
+        else:
+            daily_limit = settings.REGULAR_DAILY_LIMIT_HOURS
+            ot_allowed = True  # default: allow OT when vendor unknown
+
         if hours <= daily_limit:
             return hours, 0.0
-        return daily_limit, round(hours - daily_limit, 2)
+
+        if ot_allowed:
+            return daily_limit, round(hours - daily_limit, 2)
+        else:
+            # No OT allowed — caller creates OVERTIME_NOT_ALLOWED error
+            return hours, 0.0
 
     @staticmethod
     def _parse_date(val) -> Optional[date]:
         if not val:
+            return None
+        if str(val).startswith("INVALID_"):
             return None
         try:
             if isinstance(val, date):

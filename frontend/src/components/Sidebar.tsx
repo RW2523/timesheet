@@ -3,7 +3,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
   LayoutDashboard, Upload, FolderOpen, CheckCircle2, AlertTriangle,
-  FileSpreadsheet, Settings, Users, Clock,
+  FileSpreadsheet, Settings, Users, Clock, FlaskConical,
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -12,6 +12,10 @@ const nav = [
   { href: '/upload', label: 'Upload ZIP', icon: Upload },
   { href: '/batches', label: 'Batches', icon: FolderOpen },
   { href: '/admin', label: 'Admin Settings', icon: Settings },
+]
+
+const devNav = [
+  { href: '/test-lab', label: 'Pipeline Test Lab', icon: FlaskConical },
 ]
 
 export default function Sidebar() {
@@ -50,6 +54,29 @@ export default function Sidebar() {
             </Link>
           )
         })}
+
+        {/* Dev tools */}
+        <div className="pt-3 mt-3 border-t border-blue-800/60">
+          <p className="px-3 text-xs font-medium text-blue-500 uppercase tracking-wider mb-1">Dev Tools</p>
+          {devNav.map(({ href, label, icon: Icon }) => {
+            const active = pathname.startsWith(href)
+            return (
+              <Link
+                key={href}
+                href={href}
+                className={clsx(
+                  'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
+                  active
+                    ? 'bg-indigo-700 text-white font-medium'
+                    : 'text-blue-300 hover:bg-blue-800 hover:text-white',
+                )}
+              >
+                <Icon className="w-4 h-4 shrink-0" />
+                {label}
+              </Link>
+            )
+          })}
+        </div>
       </nav>
 
       {/* Footer */}

@@ -8,11 +8,37 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+      # NEXT_PUBLIC_API_URL is no longer needed — the frontend uses relative
+      # /api/v1 paths and Next.js proxies them to the backend internally.
+      # BACKEND_URL is the Docker-internal address Next.js rewrites proxy to.
+      - BACKEND_URL=http://backend:8000
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11435:11434"
+    volumes:
+      - /home/echomind/.ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 15s
+      retries: 8
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   backend:
     build:
@@ -25,10 +51,13 @@ services:
     volumes:
       - ./storage:/storage
       - ./backend/app:/app/app
+      - ./backend/tests:/app/tests
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     healthcheck:
@@ -44,6 +73,10 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      - HF_HOME=/storage/docling_models
+      - TRANSFORMERS_CACHE=/storage/docling_models
+      - DOCLING_ARTIFACTS_PATH=/storage/docling_models
     volumes:
       - ./storage:/storage
       - ./backend/app:/app/app
@@ -51,6 +84,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
     restart: unless-stopped

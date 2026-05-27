@@ -1,5 +1,8 @@
 """File inventory and file management endpoints."""
+import os
+import mimetypes
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
@@ -124,6 +127,36 @@ def reprocess_file(file_id: str, db: Session = Depends(get_db)):
     f.updated_at = datetime.utcnow()
     db.commit()
     return {"status": "queued", "file_id": file_id}
+
+
+@router.get("/files/{file_id}/preview")
+def preview_file(file_id: str, db: Session = Depends(get_db)):
+    """Serve the original uploaded file for inline preview."""
+    f = db.query(UploadedFile).filter(UploadedFile.id == file_id).first()
+    if not f:
+        raise HTTPException(status_code=404, detail="File not found")
+    path = f.stored_file_path
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not on disk")
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        ext = (f.file_ext or "").lower().lstrip(".")
+        mime = {
+            "pdf": "application/pdf",
+            "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xls": "application/vnd.ms-excel",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "csv": "text/csv",
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+        }.get(ext, "application/octet-stream")
+    return FileResponse(
+        path=path,
+        filename=f.file_name,
+        media_type=mime,
+        headers={"Content-Disposition": f'inline; filename="{f.file_name}"'},
+    )
 
 
 @router.get("/batches/{batch_id}/employee-matches")

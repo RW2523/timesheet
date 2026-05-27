@@ -25,6 +25,8 @@ def generate_report(batch_id: str, db: Session = Depends(get_db)):
     from app.services.report_service import ReportService
     svc = ReportService(db)
     report = svc.generate_batch_report(batch_id)
+    # Also regenerate summary CSV
+    svc.generate_summary_csv(batch_id)
     return {"status": "generated", "report_id": report.id, "file_name": report.file_name}
 
 
@@ -35,8 +37,17 @@ def download_report(report_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Report not found")
     if not os.path.exists(report.file_path):
         raise HTTPException(status_code=404, detail="Report file not found on disk")
+
+    # Pick the correct MIME type
+    if report.file_name.lower().endswith(".csv"):
+        media_type = "text/csv"
+    elif report.file_name.lower().endswith(".xlsx"):
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    else:
+        media_type = "application/octet-stream"
+
     return FileResponse(
         path=report.file_path,
         filename=report.file_name,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
     )

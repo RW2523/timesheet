@@ -134,4 +134,138 @@ def get_batch_status(batch_id: str, db: Session = Depends(get_db)):
         "progress_pct": round(
             ((counts.done or 0) / max(counts.total or 1, 1)) * 100, 1
         ),
+        "current_file": batch.current_file,
+        "current_stage": batch.current_stage or "Processing…",
     }
+
+
+@router.get("/batches/{batch_id}/stats")
+def get_batch_stats(batch_id: str, db: Session = Depends(get_db)):
+    """Return detailed file-level stats for the batch dashboard.
+
+    Used by the frontend to display the secondary stats row in BatchSummaryCards.
+    """
+    from sqlalchemy import case
+    batch = db.query(BatchUpload).filter(BatchUpload.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    stats = db.query(
+        func.sum(case((UploadedFile.ocr_required == True, 1), else_=0)).label("ocr_files"),
+        func.sum(case((UploadedFile.matched_employee_id.isnot(None), 1), else_=0)).label("matched_files"),
+        func.sum(case(
+            (UploadedFile.matched_employee_id.is_(None),
+             case((UploadedFile.is_noise_file == False, case(
+                (UploadedFile.is_duplicate == False, case(
+                    (UploadedFile.is_timesheet_candidate == True, 1), else_=0
+                )), else_=0
+             )), else_=0)),
+            else_=0,
+        )).label("unmatched_files"),
+        func.sum(case((UploadedFile.processing_status.in_(["EXTRACTION_FAILED", "FAILED"]), 1), else_=0)).label("extraction_failed"),
+        func.sum(case((UploadedFile.processing_status == "NON_TIMESHEET_DOCUMENT", 1), else_=0)).label("non_timesheet"),
+    ).filter(UploadedFile.batch_id == batch_id).first()
+
+    return {
+        "batch_id": batch_id,
+        "ocr_files": stats.ocr_files or 0,
+        "matched_files": stats.matched_files or 0,
+        "unmatched_files": stats.unmatched_files or 0,
+        "extraction_failed": stats.extraction_failed or 0,
+        "non_timesheet": stats.non_timesheet or 0,
+    }
+
+
+@router.delete("/batches/{batch_id}")
+def delete_batch(batch_id: str, db: Session = Depends(get_db)):
+    """Permanently delete a finished batch and all its related data.
+
+    Only batches that are NOT actively processing can be deleted
+    (statuses: NEEDS_REVIEW, PAYROLL_READY, COMPLETED, FAILED, CANCELLED).
+    Also removes the original ZIP file from disk to free storage.
+    """
+    import os, shutil
+    from app.db.models import (
+        RawExtraction, TimesheetSubmission, TimesheetEntry,
+        ValidationError as VE, GeneratedReport, EmployeeFileMatch, AuditLog,
+    )
+
+    batch = db.query(BatchUpload).filter(BatchUpload.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    if batch.status in ("UPLOADED", "PROCESSING"):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete a batch that is currently processing. Stop it first.",
+        )
+
+    # ── Delete child rows in dependency order ──────────────────────────────
+    file_ids = [
+        r[0] for r in db.query(UploadedFile.id).filter(UploadedFile.batch_id == batch_id).all()
+    ]
+    sub_ids = [
+        r[0] for r in db.query(TimesheetSubmission.id)
+        .filter(TimesheetSubmission.batch_id == batch_id).all()
+    ]
+
+    # Timesheet entries
+    if sub_ids:
+        db.query(TimesheetEntry).filter(
+            TimesheetEntry.submission_id.in_(sub_ids)
+        ).delete(synchronize_session=False)
+
+    # Validation errors
+    db.query(VE).filter(VE.batch_id == batch_id).delete(synchronize_session=False)
+
+    # Timesheet submissions
+    db.query(TimesheetSubmission).filter(
+        TimesheetSubmission.batch_id == batch_id
+    ).delete(synchronize_session=False)
+
+    # Raw extractions + employee file matches
+    if file_ids:
+        db.query(RawExtraction).filter(
+            RawExtraction.file_id.in_(file_ids)
+        ).delete(synchronize_session=False)
+        db.query(EmployeeFileMatch).filter(
+            EmployeeFileMatch.file_id.in_(file_ids)
+        ).delete(synchronize_session=False)
+
+    # Generated reports (DB rows + disk files)
+    reports = db.query(GeneratedReport).filter(GeneratedReport.batch_id == batch_id).all()
+    for rpt in reports:
+        try:
+            if rpt.file_path and os.path.exists(rpt.file_path):
+                os.remove(rpt.file_path)
+        except OSError:
+            pass
+    db.query(GeneratedReport).filter(
+        GeneratedReport.batch_id == batch_id
+    ).delete(synchronize_session=False)
+
+    # Uploaded files
+    db.query(UploadedFile).filter(
+        UploadedFile.batch_id == batch_id
+    ).delete(synchronize_session=False)
+
+    # Audit logs
+    db.query(AuditLog).filter(AuditLog.entity_id == batch_id).delete(synchronize_session=False)
+
+    # ── Delete the batch record ────────────────────────────────────────────
+    zip_path = batch.original_file_path
+    db.delete(batch)
+    db.commit()
+
+    # ── Remove ZIP + extracted files from disk ─────────────────────────────
+    deleted_files = 0
+    if zip_path:
+        upload_dir = os.path.dirname(zip_path)
+        if os.path.isdir(upload_dir):
+            try:
+                shutil.rmtree(upload_dir)
+                deleted_files += 1
+            except OSError:
+                pass
+
+    return {"status": "deleted", "batch_id": batch_id, "disk_cleaned": deleted_files > 0}

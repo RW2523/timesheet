@@ -169,6 +169,10 @@ class BatchUpload(Base):
     review_required_files = Column(Integer, default=0)
     payroll_ready_count = Column(Integer, default=0)
     summary_json = Column(JSONB)
+    filter_period_start = Column(Text)   # ISO date — only keep entries on/after this date
+    filter_period_end = Column(Text)     # ISO date — only keep entries on/before this date
+    current_file = Column(Text)          # file being processed right now
+    current_stage = Column(Text)         # e.g. "Parsing 3/58", "Normalizing", "Matching"
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -482,3 +486,104 @@ class AuditLog(Base):
     before_json = Column(JSONB)
     after_json = Column(JSONB)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# ── Email Integration Tables ───────────────────────────────────────────────────
+
+class EmailAccount(Base):
+    """A connected Gmail account (one per HR user / department)."""
+    __tablename__ = "email_accounts"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    label = Column(Text, nullable=False)           # user-friendly name e.g. "HR Gmail"
+    email_address = Column(Text, nullable=False, unique=True)
+    provider = Column(String(20), default="gmail") # future: outlook, etc.
+
+    # OAuth tokens — stored as text; encrypt at rest via env-level disk encryption
+    access_token = Column(Text)
+    refresh_token = Column(Text)
+    token_expiry = Column(DateTime)
+
+    is_active = Column(Boolean, default=True)
+    last_crawled_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    crawl_jobs = relationship("EmailCrawlJob", back_populates="account")
+
+
+class EmailCrawlJob(Base):
+    """A single crawl run — scans a date range and collects timesheet emails."""
+    __tablename__ = "email_crawl_jobs"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    account_id = Column(UUID(as_uuid=False), ForeignKey("email_accounts.id"), nullable=False)
+
+    # Crawl parameters
+    period_start = Column(Date, nullable=False)
+    period_end = Column(Date, nullable=False)
+    subject_filter = Column(Text)   # optional extra Gmail search query
+
+    # Status tracking
+    status = Column(String(20), default="PENDING")  # PENDING RUNNING COMPLETED FAILED
+    emails_scanned = Column(Integer, default=0)
+    emails_timesheet = Column(Integer, default=0)   # classified as timesheet submission
+    emails_skipped = Column(Integer, default=0)     # not timesheet
+    attachments_saved = Column(Integer, default=0)
+
+    # Output
+    batch_id = Column(UUID(as_uuid=False), ForeignKey("batch_uploads.id"))
+    triggered_by = Column(String(20), default="MANUAL")  # MANUAL / SCHEDULE
+    error_message = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    account = relationship("EmailAccount", back_populates="crawl_jobs")
+    messages = relationship("EmailMessage", back_populates="crawl_job")
+
+    __table_args__ = (Index("idx_email_crawl_account", "account_id"),)
+
+
+class EmailMessage(Base):
+    """A single email processed during a crawl job."""
+    __tablename__ = "email_messages"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    crawl_job_id = Column(UUID(as_uuid=False), ForeignKey("email_crawl_jobs.id"), nullable=False)
+    account_id = Column(UUID(as_uuid=False), ForeignKey("email_accounts.id"), nullable=False)
+
+    # Gmail identity — used to deduplicate across crawls
+    gmail_message_id = Column(Text, nullable=False, unique=True)
+
+    # Email header data
+    subject = Column(Text)
+    sender_name = Column(Text)
+    sender_email = Column(Text)
+    received_at = Column(DateTime)
+    body_snippet = Column(Text)  # first 500 chars of body
+
+    # Classification result
+    is_timesheet = Column(Boolean)
+    classification_reason = Column(Text)
+    classification_method = Column(String(20))  # RULE_BASED / LLM / MANUAL
+    classification_confidence = Column(Numeric(4, 3))
+
+    # Attachments
+    has_attachments = Column(Boolean, default=False)
+    attachments_metadata = Column(JSONB)  # [{name, size_bytes, mime, saved_path}]
+
+    # Processing outcome
+    processing_status = Column(String(20), default="PENDING")  # PENDING EXTRACTED SKIPPED FAILED
+    batch_id = Column(UUID(as_uuid=False), ForeignKey("batch_uploads.id"))
+    skip_reason = Column(Text)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    crawl_job = relationship("EmailCrawlJob", back_populates="messages")
+
+    __table_args__ = (
+        Index("idx_email_messages_sender", "sender_email"),
+        Index("idx_email_messages_job", "crawl_job_id"),
+    )

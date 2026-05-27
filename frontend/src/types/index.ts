@@ -13,6 +13,10 @@ export interface BatchSummary {
   created_at: string
   updated_at: string
   summary_json?: Record<string, unknown>
+  filter_period_start?: string
+  filter_period_end?: string
+  current_file?: string
+  current_stage?: string
 }
 
 export interface DashboardStats {

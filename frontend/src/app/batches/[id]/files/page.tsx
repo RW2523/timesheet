@@ -1,9 +1,9 @@
 'use client'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { listFiles, markNonTimesheet, reprocessFile, getRawExtraction } from '@/lib/api'
+import { listFiles, markNonTimesheet, reprocessFile, getRawExtraction, previewFileUrl } from '@/lib/api'
 import StatusBadge from '@/components/ui/StatusBadge'
-import { FileText, Eye, RefreshCw, Ban, AlertTriangle } from 'lucide-react'
+import { FileText, Eye, RefreshCw, Ban, ExternalLink, X } from 'lucide-react'
 
 interface Props { params: { id: string } }
 
@@ -12,6 +12,7 @@ export default function FilesPage({ params }: Props) {
   const qc = useQueryClient()
   const [rawExtModal, setRawExtModal] = useState<string | null>(null)
   const [rawData, setRawData] = useState<unknown>(null)
+  const [previewFile, setPreviewFile] = useState<{ id: string; name: string; ext: string } | null>(null)
 
   const { data, isLoading } = useQuery({
     queryKey: ['files', batchId],
@@ -37,6 +38,8 @@ export default function FilesPage({ params }: Props) {
       alert('No raw extraction available for this file yet.')
     }
   }
+
+  const previewable = (ext: string | undefined) => ['.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.tif'].includes((ext ?? '').toLowerCase())
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -71,9 +74,30 @@ export default function FilesPage({ params }: Props) {
                   <td className="px-3 py-2.5"><StatusBadge status={f.processing_status} /></td>
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1">
+                      {/* Preview original file */}
+                      {previewable(f.file_ext) ? (
+                        <button
+                          onClick={() => setPreviewFile({ id: f.id, name: f.file_name, ext: f.file_ext ?? '' })}
+                          title="Preview file"
+                          className="p-1 rounded hover:bg-indigo-100 text-indigo-500 transition-colors"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
+                      ) : (
+                        <a
+                          href={previewFileUrl(f.id)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open file"
+                          className="p-1 rounded hover:bg-indigo-100 text-indigo-500 transition-colors"
+                        >
+                          <ExternalLink className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                      {/* Raw extraction JSON */}
                       <button onClick={() => viewRaw(f.id)} title="View raw extraction"
                         className="p-1 rounded hover:bg-blue-100 text-blue-500 transition-colors">
-                        <Eye className="w-3.5 h-3.5" />
+                        <FileText className="w-3.5 h-3.5" />
                       </button>
                       <button onClick={() => reprocessMut.mutate(f.id)} title="Reprocess"
                         className="p-1 rounded hover:bg-green-100 text-green-500 transition-colors">
@@ -89,6 +113,40 @@ export default function FilesPage({ params }: Props) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* File preview modal */}
+      {previewFile && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200 shrink-0">
+              <div className="flex items-center gap-2 text-sm font-medium text-gray-800 truncate">
+                <FileText className="w-4 h-4 text-blue-500 shrink-0" />
+                <span className="truncate">{previewFile.name}</span>
+              </div>
+              <div className="flex items-center gap-3 ml-4 shrink-0">
+                <a
+                  href={previewFileUrl(previewFile.id)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" /> Open in tab
+                </a>
+                <button onClick={() => setPreviewFile(null)} className="text-gray-400 hover:text-gray-700">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-hidden">
+              <iframe
+                src={previewFileUrl(previewFile.id)}
+                className="w-full h-full border-0 min-h-[70vh]"
+                title={previewFile.name}
+              />
+            </div>
+          </div>
         </div>
       )}
 

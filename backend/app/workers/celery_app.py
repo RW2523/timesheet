@@ -17,8 +17,4 @@ celery_app.conf.update(
     task_track_started=True,
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_routes={
-        "app.workers.tasks.process_batch": {"queue": "batch"},
-        "app.workers.tasks.process_single_file": {"queue": "files"},
-    },
 )

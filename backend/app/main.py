@@ -22,6 +22,8 @@ from app.api import (
     routes_admin,
     routes_payroll,
     routes_approvals,
+    routes_email,
+    routes_debug,
 )
 
 setup_logging()
@@ -43,9 +45,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_origins = settings.allowed_origins_list
+# When wildcard is configured, we must use allow_origin_regex instead
+# because FastAPI/Starlette disallows allow_credentials=True with ["*"].
+_use_wildcard = _origins == ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins_list,
+    allow_origins=[] if _use_wildcard else _origins,
+    allow_origin_regex=r".*" if _use_wildcard else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,6 +69,8 @@ app.include_router(routes_reports.router, prefix=PREFIX, tags=["reports"])
 app.include_router(routes_payroll.router, prefix=PREFIX, tags=["payroll"])
 app.include_router(routes_approvals.router, prefix=PREFIX, tags=["approvals"])
 app.include_router(routes_admin.router, prefix=PREFIX, tags=["admin"])
+app.include_router(routes_email.router, prefix=PREFIX, tags=["email"])
+app.include_router(routes_debug.router, prefix=PREFIX, tags=["debug"])
 
 
 @app.get("/health", tags=["health"])

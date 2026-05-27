@@ -26,21 +26,42 @@ class BatchService:
         return batch.original_file_path
 
     def finalize_batch(self, batch_id: str) -> None:
-        """Recalculate counters and set final status."""
-        q = self.db.query(UploadedFile).filter(UploadedFile.batch_id == batch_id)
-        total = q.count()
-        ignored = q.filter(UploadedFile.is_noise_file == True).count()
-        dups = q.filter(UploadedFile.is_duplicate == True).count()
-        processed = q.filter(UploadedFile.processing_status == "COMPLETED").count()
-        failed = q.filter(UploadedFile.processing_status == "FAILED").count()
-        review = q.filter(UploadedFile.processing_status == "NEEDS_REVIEW").count()
+        """Recalculate counters and set final status.
 
-        from app.db.models import TimesheetSubmission
+        A batch is PAYROLL_READY only when:
+          1. No files are stuck in FAILED or NEEDS_REVIEW/EXTRACTION_FAILED state, AND
+          2. There are no open BLOCKER-level validation errors.
+        """
+        from app.db.models import TimesheetSubmission, ValidationError
+
+        q = self.db.query(UploadedFile).filter(UploadedFile.batch_id == batch_id)
+        total    = q.count()
+        ignored  = q.filter(UploadedFile.is_noise_file == True).count()
+        dups     = q.filter(UploadedFile.is_duplicate == True).count()
+        processed = q.filter(
+            UploadedFile.processing_status.in_(["COMPLETED", "MATCHED", "NORMALIZED"])
+        ).count()
+        failed = q.filter(UploadedFile.processing_status == "FAILED").count()
+        review = q.filter(
+            UploadedFile.processing_status.in_(["NEEDS_REVIEW", "EXTRACTION_FAILED"])
+        ).count()
+
         payroll_ready = (
             self.db.query(func.count(TimesheetSubmission.id))
             .filter(
                 TimesheetSubmission.batch_id == batch_id,
                 TimesheetSubmission.payroll_status == "READY",
+            )
+            .scalar() or 0
+        )
+
+        # Count open validation blockers — these must all be resolved before payroll
+        open_blockers = (
+            self.db.query(func.count(ValidationError.id))
+            .filter(
+                ValidationError.batch_id == batch_id,
+                ValidationError.status == "OPEN",
+                ValidationError.severity == "BLOCKER",
             )
             .scalar() or 0
         )
@@ -54,11 +75,13 @@ class BatchService:
             batch.failed_files = failed
             batch.review_required_files = review
             batch.payroll_ready_count = payroll_ready
-            batch.status = "NEEDS_REVIEW" if (failed > 0 or review > 0) else "PAYROLL_READY"
+            needs_review = (failed > 0) or (review > 0) or (open_blockers > 0)
+            batch.status = "NEEDS_REVIEW" if needs_review else "PAYROLL_READY"
             batch.updated_at = datetime.utcnow()
             self.db.commit()
 
         logger.info(
             f"Batch {batch_id} finalized: {total} total, {processed} processed, "
-            f"{failed} failed, {review} review, {payroll_ready} payroll-ready"
+            f"{failed} failed, {review} review, {open_blockers} open blockers, "
+            f"{payroll_ready} payroll-ready"
         )

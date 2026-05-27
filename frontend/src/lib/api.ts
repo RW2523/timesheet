@@ -5,7 +5,10 @@ import type {
   Employee, PayrollPeriod,
 } from '@/types'
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1'
+// Always use a relative path so the browser calls the same origin it loaded
+// the page from. Next.js rewrites /api/v1/* → backend internally, which means
+// this works identically on localhost, Tailscale, or any other hostname.
+const BASE = '/api/v1'
 
 const http = axios.create({ baseURL: BASE, timeout: 30000 })
 
@@ -37,6 +40,10 @@ export const cancelBatch = async (batchId: string) => {
   return data
 }
 
+export const deleteBatch = async (batchId: string) => {
+  const { data } = await http.delete(`/batches/${batchId}`)
+  return data
+}
 export const getBatchStatus = async (batchId: string) => {
   const { data } = await http.get(`/batches/${batchId}/status`)
   return data as {
@@ -47,6 +54,20 @@ export const getBatchStatus = async (batchId: string) => {
     failed_files: number
     review_files: number
     progress_pct: number
+    current_file?: string
+    current_stage?: string
+  }
+}
+
+export const getBatchStats = async (batchId: string) => {
+  const { data } = await http.get(`/batches/${batchId}/stats`)
+  return data as {
+    batch_id: string
+    ocr_files: number
+    matched_files: number
+    unmatched_files: number
+    extraction_failed: number
+    non_timesheet: number
   }
 }
 
@@ -57,11 +78,15 @@ export const uploadZip = async (
   payrollPeriodId?: string,
   notes?: string,
   onProgress?: (pct: number) => void,
+  periodType?: string,
+  periodValue?: string,
 ) => {
   const form = new FormData()
   form.append('file', file)
   if (payrollPeriodId) form.append('payroll_period_id', payrollPeriodId)
   if (notes) form.append('notes', notes)
+  form.append('period_type', periodType || 'month')
+  if (periodValue) form.append('period_value', periodValue)
 
   const { data } = await http.post('/upload', form, {
     headers: { 'Content-Type': 'multipart/form-data' },
@@ -124,8 +149,38 @@ export const listValidation = async (
   return data
 }
 
-export const resolveValidationError = async (errorId: string, note?: string) => {
-  const { data } = await http.post(`/validation/${errorId}/resolve`, { resolution_note: note })
+export const resolveValidationError = async (
+  errorId: string,
+  note?: string,
+  correction?: {
+    employee_name?: string
+    employee_id?: string
+    hours?: number
+    date?: string
+    notes?: string
+  },
+  resolvedByName?: string,
+) => {
+  const { data } = await http.post(`/validation/${errorId}/resolve`, {
+    resolution_note: note,
+    resolved_by_name: resolvedByName || undefined,
+    correction: correction || null,
+  })
+  return data
+}
+
+// These return absolute URLs used directly in <a href> / <img src>.
+// We build them at call-time using window.location.origin so they stay
+// correct on localhost, Tailscale, or any other host.
+function apiBase(): string {
+  if (typeof window !== 'undefined') return `${window.location.origin}/api/v1`
+  return '/api/v1'
+}
+
+export const previewFileUrl = (fileId: string) => `${apiBase()}/files/${fileId}/preview`
+
+export const getInactiveEmployees = async () => {
+  const { data } = await http.get('/admin/inactive-employees')
   return data
 }
 
@@ -141,7 +196,7 @@ export const generateReport = async (batchId: string) => {
   return data
 }
 
-export const downloadReportUrl = (reportId: string) => `${BASE}/reports/${reportId}/download`
+export const downloadReportUrl = (reportId: string) => `${apiBase()}/reports/${reportId}/download`
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
@@ -157,6 +212,16 @@ export const listPayrollPeriods = async () => {
 
 export const listVendors = async () => {
   const { data } = await http.get('/admin/vendors')
+  return data
+}
+
+export const clearBatchData = async () => {
+  const { data } = await http.delete('/admin/clear-batch-data', { params: { confirm: 'CONFIRM' } })
+  return data
+}
+
+export const clearAllData = async () => {
+  const { data } = await http.delete('/admin/clear-all-data', { params: { confirm: 'DELETE_EVERYTHING' } })
   return data
 }
 

@@ -415,3 +415,221 @@ class ReportService:
         for col in ws.columns:
             max_len = max((len(str(cell.value or "")) for cell in col), default=0)
             ws.column_dimensions[get_column_letter(col[0].column)].width = min(max_len + 4, 50)
+
+    # ── Final summary CSV ─────────────────────────────────────────────────────
+
+    def generate_summary_csv(self, batch_id: str) -> Optional[str]:
+        """Create a comprehensive per-file summary CSV for the batch.
+
+        Every file (including failed/noise/duplicate) has a row.
+        Non-timesheet and failed files show their reason in the Notes column.
+        Payroll export contains only PAYROLL_READY submissions.
+
+        Columns (matches Phase-12 spec):
+          File Name, Folder Path, Document Type, Employee Candidate, Matched Employee,
+          Match Status, Match Confidence, Extraction Status, Extraction Confidence,
+          Total Extracted Entries, Total Hours, Regular Hours, Overtime Hours,
+          Period Start, Period End, Approval Status, Payroll Status,
+          Blocker Count, Warning Count, Notes
+        """
+        import csv
+        import io
+        from sqlalchemy import func as sqlfunc
+
+        try:
+            batch = self.db.query(BatchUpload).filter(BatchUpload.id == batch_id).first()
+            if not batch:
+                return None
+
+            # All files in batch
+            files = (
+                self.db.query(UploadedFile)
+                .filter(UploadedFile.batch_id == batch_id)
+                .order_by(UploadedFile.folder_path, UploadedFile.file_name)
+                .all()
+            )
+
+            rows = []
+            for f in files:
+                emp = (
+                    self.db.query(Employee).filter(Employee.id == f.matched_employee_id).first()
+                    if f.matched_employee_id else None
+                )
+
+                # Raw extraction for confidence/entry count
+                raw = (
+                    self.db.query(self.db.query(type(None)).join).__class__  # placeholder
+                    if False else None
+                )
+                from app.db.models import RawExtraction
+                raw = (
+                    self.db.query(RawExtraction)
+                    .filter(RawExtraction.file_id == f.id)
+                    .first()
+                )
+                extraction_confidence = float(raw.confidence or 0) if raw else 0.0
+                entry_count = len((raw.llm_json or {}).get("entries", [])) if raw else 0
+                extraction_method = (raw.extraction_method or "") if raw else ""
+
+                # Submission for this file
+                sub = (
+                    self.db.query(TimesheetSubmission)
+                    .filter(TimesheetSubmission.file_id == f.id)
+                    .order_by(TimesheetSubmission.created_at.desc())
+                    .first()
+                )
+
+                if sub:
+                    totals = (
+                        self.db.query(
+                            sqlfunc.sum(TimesheetEntry.calculated_hours).label("calc"),
+                            sqlfunc.sum(TimesheetEntry.entered_hours).label("entered"),
+                            sqlfunc.sum(TimesheetEntry.regular_hours).label("regular"),
+                            sqlfunc.sum(TimesheetEntry.overtime_hours).label("overtime"),
+                        )
+                        .filter(TimesheetEntry.submission_id == sub.id)
+                        .first()
+                    )
+                    # Prefer calculated_hours (from in/out) then fall back to entered
+                    total_hrs = float(totals.calc or totals.entered or 0)
+                    reg_hrs = float(totals.regular or 0)
+                    ot_hrs = float(totals.overtime or 0)
+                    period_start = str(sub.timesheet_start_date or "")
+                    period_end = str(sub.timesheet_end_date or "")
+                    approval_status = sub.approval_status or ""
+                    payroll_status = sub.payroll_status or ""
+
+                    # Count blockers and warnings
+                    blocker_count = (
+                        self.db.query(ValidationError)
+                        .filter(
+                            ValidationError.submission_id == sub.id,
+                            ValidationError.severity.in_(["BLOCKER", "ERROR"]),
+                            ValidationError.status == "OPEN",
+                        )
+                        .count()
+                    )
+                    warning_count = (
+                        self.db.query(ValidationError)
+                        .filter(
+                            ValidationError.submission_id == sub.id,
+                            ValidationError.severity == "WARNING",
+                            ValidationError.status == "OPEN",
+                        )
+                        .count()
+                    )
+                else:
+                    total_hrs = reg_hrs = ot_hrs = None
+                    period_start = period_end = approval_status = ""
+                    payroll_status = "EXCLUDED" if not f.is_timesheet_candidate else "NOT_READY"
+                    blocker_count = warning_count = 0
+
+                # Notes / reason
+                notes_parts = []
+                if f.is_noise_file:
+                    notes_parts.append("NOISE_FILE")
+                elif f.is_duplicate:
+                    notes_parts.append("DUPLICATE_FILE")
+                elif f.processing_status == "UNSUPPORTED_FILE_TYPE":
+                    notes_parts.append("UNSUPPORTED_FILE_TYPE")
+                elif f.processing_status == "NON_TIMESHEET_DOCUMENT":
+                    notes_parts.append("NON_TIMESHEET_DOCUMENT")
+                elif f.processing_status in ("EXTRACTION_FAILED", "FAILED"):
+                    notes_parts.append("EXTRACTION_FAILED")
+                elif f.processing_status == "NEEDS_REVIEW":
+                    notes_parts.append("NEEDS_REVIEW")
+                elif not sub and f.is_timesheet_candidate:
+                    notes_parts.append("MISSING_SUBMISSION")
+
+                if total_hrs is None and not notes_parts:
+                    notes_parts.append("MISSING")
+
+                # Validation issues for file-level errors (no submission)
+                if not sub:
+                    file_errors = (
+                        self.db.query(ValidationError)
+                        .filter(
+                            ValidationError.file_id == f.id,
+                            ValidationError.batch_id == batch_id,
+                            ValidationError.status == "OPEN",
+                        )
+                        .all()
+                    )
+                    for ve in file_errors:
+                        notes_parts.append(ve.rule_code)
+                        if ve.severity in ("BLOCKER", "ERROR"):
+                            blocker_count += 1
+                        elif ve.severity == "WARNING":
+                            warning_count += 1
+
+                rows.append({
+                    "File Name": f.file_name,
+                    "Folder Path": f.folder_path or "",
+                    "Document Type": f.processing_status or "",
+                    "Employee Candidate": f.detected_employee_name or "",
+                    "Matched Employee": emp.full_name if emp else "",
+                    "Match Status": f.match_status or "",
+                    "Match Confidence": f"{float(f.match_confidence or 0):.0%}" if f.match_confidence else "",
+                    "Extraction Method": extraction_method,
+                    "Extraction Status": f.processing_status or "",
+                    "Extraction Confidence": f"{extraction_confidence:.0%}",
+                    "Total Extracted Entries": entry_count,
+                    "Total Hours": f"{total_hrs:.2f}" if total_hrs is not None else "MISSING",
+                    "Regular Hours": f"{reg_hrs:.2f}" if reg_hrs is not None else "MISSING",
+                    "Overtime Hours": f"{ot_hrs:.2f}" if ot_hrs is not None else "MISSING",
+                    "Period Start": period_start,
+                    "Period End": period_end,
+                    "Approval Status": approval_status,
+                    "Payroll Status": payroll_status,
+                    "Blocker/Error Count": blocker_count,
+                    "Warning Count": warning_count,
+                    "OCR Used": "Yes" if f.ocr_required else "No",
+                    "Duplicate": "Yes" if f.is_duplicate else "No",
+                    "Notes": " | ".join(notes_parts) if notes_parts else "OK",
+                })
+
+            # Build CSV in memory
+            buf = io.StringIO()
+            fieldnames = [
+                "File Name", "Folder Path", "Document Type",
+                "Employee Candidate", "Matched Employee",
+                "Match Status", "Match Confidence",
+                "Extraction Method", "Extraction Status", "Extraction Confidence",
+                "Total Extracted Entries",
+                "Total Hours", "Regular Hours", "Overtime Hours",
+                "Period Start", "Period End",
+                "Approval Status", "Payroll Status",
+                "Blocker/Error Count", "Warning Count",
+                "OCR Used", "Duplicate", "Notes",
+            ]
+            writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+            csv_bytes = buf.getvalue().encode("utf-8")
+
+            period_label = f"_{batch.filter_period_start[:7]}" if batch.filter_period_start else ""
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            stem = os.path.splitext(batch.source_name)[0][:40]
+            fname = f"summary_{stem}{period_label}_{ts}.csv"
+
+            report_dir = os.path.join(settings.STORAGE_ROOT, "reports", batch_id)
+            os.makedirs(report_dir, exist_ok=True)
+            csv_path = os.path.join(report_dir, fname)
+            with open(csv_path, "wb") as fh:
+                fh.write(csv_bytes)
+
+            rec = GeneratedReport(
+                id=gen_uuid(),
+                batch_id=batch_id,
+                report_type="SUMMARY_CSV",
+                file_name=fname,
+                file_path=csv_path,
+            )
+            self.db.add(rec)
+            self.db.commit()
+            logger.info(f"Summary CSV saved: {csv_path} ({len(rows)} rows)")
+            return csv_path
+
+        except Exception as exc:
+            logger.error(f"generate_summary_csv failed for {batch_id}: {exc}", exc_info=True)
+            return None
