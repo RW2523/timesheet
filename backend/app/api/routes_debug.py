@@ -559,6 +559,49 @@ def _run_vlm(path: str, ext: str) -> Dict:
     return {"error": f"VLM not applicable for {ext}", "raw_text": "", "page_results": []}
 
 
+# ── Stage 5b: OCR + VLM Fusion ────────────────────────────────────────────────
+
+def _run_ocr_vlm(path: str, ext: str) -> Dict:
+    """OCR (accurate text) + VLM (layout) fusion → structured Markdown + tables."""
+    from app.services.ocr_vlm_fusion_service import OcrVlmFusionService
+    r = OcrVlmFusionService().process(path, ext, max_pages=20)
+    if r.get("error") and not r.get("raw_text"):
+        raise Exception(r["error"])
+
+    raw_text   = r.get("raw_text") or ""
+    raw_tables = r.get("raw_tables") or []
+    page_results = r.get("page_results") or []
+
+    summary_lines = []
+    if r.get("model"):
+        summary_lines.append(f"Vision model: {r['model']}")
+    if r.get("pages_processed"):
+        summary_lines.append(f"Pages processed: {r['pages_processed']}")
+    for pg in page_results:
+        if pg.get("status") == "success":
+            summary_lines.append(
+                f"  Page {pg['page']}: OCR {pg.get('ocr_chars',0)} chars "
+                f"({pg.get('ocr_engine','?')}, conf {pg.get('ocr_confidence',0)}) "
+                f"→ fused {pg.get('fused_chars',0)} chars"
+            )
+        else:
+            summary_lines.append(f"  Page {pg['page']}: {pg.get('error','error')}")
+
+    return {
+        "text":          raw_text,
+        "text_chars":    len(raw_text),
+        "tables":        len(raw_tables),
+        "raw_tables":    raw_tables,
+        "ocr_text":      r.get("ocr_text", ""),
+        "page_results":  page_results,
+        "pages_processed": r.get("pages_processed", 0),
+        "model":         r.get("model"),
+        "warnings":      r.get("warnings", []),
+        "fusion_summary": "\n".join(summary_lines),
+        "raw_output":    r,
+    }
+
+
 # ── Stage 6: Docling ──────────────────────────────────────────────────────────
 
 def _run_docling(path: str, ext: str) -> Dict:
@@ -891,12 +934,14 @@ def _get_available_parsers(ext: str) -> List[Dict]:
             {"id": "tesseract",  "name": "Tesseract",   "desc": "Classic OCR — for scanned PDFs",              "category": "ocr"},
             {"id": "paddle",     "name": "PaddleOCR",   "desc": "GPU-accelerated OCR — high accuracy",         "category": "ocr"},
             {"id": "vlm",        "name": "VLM Vision",  "desc": "Vision LLM reads each page as image",         "category": "vlm"},
+            {"id": "ocr_vlm",    "name": "OCR + VLM Fusion", "desc": "OCR text + VLM layout → structured tables (best for image PDFs)", "category": "vlm"},
         ]
     if ext in IMAGE_EXTS:
         return [
             {"id": "tesseract", "name": "Tesseract",  "desc": "Classic OCR engine",             "category": "ocr"},
             {"id": "paddle",    "name": "PaddleOCR",  "desc": "GPU-accelerated, high accuracy", "category": "ocr"},
             {"id": "vlm",       "name": "VLM Vision", "desc": "Vision LLM understands context", "category": "vlm"},
+            {"id": "ocr_vlm",   "name": "OCR + VLM Fusion", "desc": "OCR text + VLM layout → structured tables", "category": "vlm"},
             {"id": "docling",   "name": "Docling",    "desc": "AI document parser",             "category": "ai"},
         ]
     if ext in (".xlsx", ".xls"):
@@ -934,7 +979,7 @@ async def lab_run_parser(session_id: str, body: dict):
         raise HTTPException(400, "Field 'parser' is required.")
 
     # For fast parsers just run synchronously in-thread and return immediately
-    SLOW_PARSERS = {"vlm", "docling", "marker", "docx_vlm", "docx_ocr", "tesseract", "paddle"}
+    SLOW_PARSERS = {"vlm", "ocr_vlm", "docling", "marker", "docx_vlm", "docx_ocr", "tesseract", "paddle"}
 
     if parser not in SLOW_PARSERS:
         t0 = time.perf_counter()
@@ -1167,6 +1212,8 @@ def _dispatch_parser(parser: str, path: str, ext: str) -> Dict[str, Any]:
             "page_results": r.get("page_results", []),
             "raw_output":   r,
         }
+    if parser == "ocr_vlm":
+        return _run_ocr_vlm(path, ext)
     if parser == "vlm":
         r = _run_vlm(path, ext)
         if r.get("error") and not r.get("raw_text"):

@@ -78,6 +78,42 @@ Output the non-table text as plain lines, and every table as a Markdown table.
 """
 
 
+# ── Fusion prompt ───────────────────────────────────────────────────────────
+# Used by the OCR + VLM fusion flow: the VLM is given the page image AND the
+# raw OCR text, and asked to correlate them — OCR provides accurate characters,
+# the image provides layout/structure.
+
+FUSION_PROMPT = """\
+You are reconstructing a timesheet page into clean, structured Markdown.
+
+You are given the raw OCR text extracted from THIS exact page image. The OCR \
+text has ACCURATE characters and numbers, but its table layout (which value \
+belongs in which column/row) is unreliable and jumbled.
+
+YOUR JOB: use the IMAGE to understand the visual table layout, and use the OCR \
+TEXT as the source of truth for the exact characters, numbers, dates and names. \
+Correlate the two and reproduce the page faithfully.
+
+RULES:
+- Reproduce every table as a GitHub-style Markdown table (| col | col |), \
+  header row first, then one line per data row.
+- Keep the exact column order shown in the image; one cell per column; keep \
+  empty cells as empty columns (`| |`) so alignment is preserved.
+- Use values from the OCR text — do NOT invent numbers, dates, hours or names \
+  that are not present in the OCR text or clearly legible in the image.
+- Put non-table text (employee name, employer, period, totals, approval, \
+  signatures) as plain lines near the relevant table.
+- If the OCR text and the image disagree on a character, prefer the one that is \
+  clearer, but never fabricate a value.
+- Output ONLY the reconstructed Markdown — no commentary, no explanation.
+
+RAW OCR TEXT FOR THIS PAGE:
+---
+{ocr_text}
+---
+"""
+
+
 class VLMService:
     """Vision OCR service.  Returns raw page text; all structuring is done by callers."""
 
@@ -242,11 +278,12 @@ class VLMService:
 
     # ── Single-image OCR call ──────────────────────────────────────────────────
 
-    def _call_vision(self, model: str, img_b64: str) -> Tuple[str, Optional[str]]:
-        """Send one image to the vision model with the raw OCR prompt.
+    def _call_vision(self, model: str, img_b64: str,
+                     prompt: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """Send one image to the vision model.
 
-        Returns (raw_text, error_or_None).
-        The VLM is NOT asked to produce JSON — only to transcribe visible text.
+        Returns (raw_text, error_or_None).  ``prompt`` defaults to the plain OCR
+        transcription prompt; the fusion flow passes a grounded prompt instead.
         """
         timeout = max(getattr(settings, "LLM_TIMEOUT", 300), 300)
         try:
@@ -254,7 +291,7 @@ class VLMService:
                 f"{self._base_url}/api/generate",
                 json={
                     "model":   model,
-                    "prompt":  OCR_PROMPT,
+                    "prompt":  prompt or OCR_PROMPT,
                     "images":  [img_b64],
                     "stream":  False,
                     "options": {
@@ -275,6 +312,19 @@ class VLMService:
             return "", f"VLM request timed out after {timeout}s"
         except Exception as exc:
             return "", str(exc)
+
+    def correlate_page(self, img_b64: str, ocr_text: str,
+                       model: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """OCR + VLM fusion: reconstruct one page to structured Markdown using
+        the page image (layout) grounded on the OCR text (accurate characters).
+
+        Returns (markdown, error_or_None).
+        """
+        model = model or self.get_available_vision_model()
+        if not model:
+            return "", self._no_model_result()["error"]
+        prompt = FUSION_PROMPT.format(ocr_text=(ocr_text or "")[:8000])
+        return self._call_vision(model, img_b64, prompt=prompt)
 
     # ── Backward-compat alias ──────────────────────────────────────────────────
 
