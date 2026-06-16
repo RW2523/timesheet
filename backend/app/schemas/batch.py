@@ -20,6 +20,10 @@ class BatchSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     summary_json: Optional[Any] = None
+    filter_period_start: Optional[str] = None
+    filter_period_end: Optional[str] = None
+    current_file: Optional[str] = None
+    current_stage: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

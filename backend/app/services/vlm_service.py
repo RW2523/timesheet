@@ -1,24 +1,18 @@
 """
-VLM Service — Vision-as-OCR layer.
+VLM Service — Vision OCR layer.
 
-The VLM is used ONLY to read visible text from image/PDF pages.
-It does NOT extract structured JSON.  All structuring and validation
-is delegated to TimesheetRuleParser (app/services/timesheet_rule_parser.py).
+SOLE PURPOSE: read every piece of visible text from an image or PDF page
+and return it as a plain string.  No JSON, no structured extraction, no
+rule parsing.  Callers receive raw text and can feed it to the LLM stage.
 
 Pipeline:
-  image/PDF  →  VLMService.read_text_from_*()  →  raw_text (str)
-             →  TimesheetRuleParser.parse(raw_text)  →  validated result dict
+  image / PDF  →  VLMService.read_text_from_*()
+              →  per-page raw text list  +  combined raw_text (str)
+              →  caller feeds raw_text to LLM
 
-Model priority (first one found in Ollama):
-  1. llava:13b
-  2. llava:7b  (default pull)
-  3. llava
-  4. llava-phi3
-  5. moondream
-  6. bakllava
-  7. minicpm-v
-  8. llama3.2-vision
-  9. Any model containing "vision" or "llava"
+Model priority (first available in Ollama):
+  llava:13b > llava:7b > llava > llava-phi3 > moondream >
+  bakllava > minicpm-v > llama3.2-vision > any model with "vision"/"llava"
 """
 from __future__ import annotations
 
@@ -39,36 +33,50 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".webp", ".bmp"}
 PDF_RENDER_DPI = 250
 
 VISION_MODEL_CANDIDATES = [
+    # Qwen2.5-VL — best document/table understanding, top priority
+    "qwen2.5vl:7b", "qwen2.5vl:3b", "qwen2.5vl:72b", "qwen2.5vl",
+    # llava fallbacks
     "llava:13b", "llava:7b", "llava", "llava-phi3",
     "moondream", "bakllava", "minicpm-v", "llama3.2-vision",
 ]
 
-# ── OCR prompt ─────────────────────────────────────────────────────────────────
-# The VLM is used like a smart scanner.  Ask for EXACT text, nothing invented.
+# ── OCR prompt ────────────────────────────────────────────────────────────────
+# The VLM is used like a high-accuracy scanner.
+# It MUST NOT invent values, add JSON, or summarise — only transcribe.
 
 OCR_PROMPT = """\
-You are acting as an OCR scanner reading a document image.
+You are an OCR scanner reading a document image.
 
-Your only job: output every piece of text you can see in this image,
-line by line, exactly as it appears.
+YOUR ONLY JOB: output every piece of text you can see in this image, \
+exactly as it appears, line by line.
 
-Include:
-- All header lines (company name, employee name, ID, department, dates, period)
-- Every row in every table (date, day, in-time, out-time, break, hours, task, notes)
-- All total/summary lines at the bottom
-- Any approval, signature, or stamp text
+INCLUDE ALL OF THE FOLLOWING:
+- Company / employer name, logo text, header lines
+- Employee name, employee ID, department, job title, manager name
+- Pay period, pay dates, timesheet period, week ending date
+- Every row in every table: date, day of week, in-time, out-time, \
+  break time, regular hours, overtime hours, sick hours, vacation hours, \
+  holiday hours, total hours, task / project code, notes / comments
+- Sub-total rows, weekly total rows, grand total rows
+- Footer lines, certification text, signature labels, approval text, \
+  approval dates, status fields
 
-Do NOT:
-- Add commentary, explanations, or formatting
-- Invent or guess values you cannot see
-- Skip any line, even if it looks empty or redundant
+DO NOT:
+- Add commentary, explanations, or section headings that are not in the image
+- Invent or guess any value you cannot clearly see
+- Skip any line, row, or column — even if it looks blank or repetitive
+- Format as JSON, XML, or any structured format
+- Summarise or paraphrase
 
-Output the raw document text only.
+OUTPUT FORMAT:
+Reproduce the text exactly as it appears, preserving line breaks. \
+Use a single blank line between distinct visual sections if helpful. \
+Do not add any other markup.
 """
 
 
 class VLMService:
-    """Vision-as-OCR service.  Returns raw text; caller handles structuring."""
+    """Vision OCR service.  Returns raw page text; all structuring is done by callers."""
 
     def __init__(self) -> None:
         self._base_url      = settings.OLLAMA_BASE_URL
@@ -87,16 +95,18 @@ class VLMService:
             models = [m["name"] for m in resp.json().get("models", [])]
             for candidate in VISION_MODEL_CANDIDATES:
                 for m in models:
-                    if m == candidate or m.startswith(candidate):
+                    if m == candidate or m.startswith(candidate + ":"):
                         self._vision_model = m
+                        logger.info("VLM: selected model %s", m)
                         return m
             for m in models:
-                if any(kw in m.lower() for kw in ("vision", "llava", "moondream")):
+                if any(kw in m.lower() for kw in ("vision", "llava", "moondream", "qwen2.5vl")):
                     self._vision_model = m
+                    logger.info("VLM: selected model %s (keyword match)", m)
                     return m
         except httpx.ConnectError:
             logger.warning(
-                "VLM: cannot reach Ollama at %s — start ollama with "
+                "VLM: cannot reach Ollama at %s — ensure Ollama is running with "
                 "OLLAMA_HOST=0.0.0.0:11434", self._base_url,
             )
         except Exception as exc:
@@ -109,25 +119,39 @@ class VLMService:
         if not model:
             return self._no_model_result()
 
+        t0      = time.perf_counter()
         img_b64 = self._load_image_as_b64(path)
-        text, err = self._call_vision_raw_text(model, img_b64)
+        text, err = self._call_vision(model, img_b64)
+        elapsed = round((time.perf_counter() - t0) * 1000)
+
         if err:
-            return {"error": err, "raw_text": "", "model": model, "pages_processed": 0}
+            return {
+                "error": err, "raw_text": "", "model": model,
+                "pages_processed": 0, "page_results": [],
+            }
 
-        return self._finalize(model, raw_text=text, pages_processed=1,
-                              page_results=[{"page": 1, "status": "success",
-                                             "chars": len(text)}])
+        return self._build_result(
+            model, raw_text=text, pages_processed=1,
+            page_results=[{
+                "page": 1, "status": "success",
+                "chars": len(text), "duration_ms": elapsed,
+                "preview": text[:200] + ("…" if len(text) > 200 else ""),
+            }],
+        )
 
-    def read_text_from_pdf(self, path: str, max_pages: int = 10) -> Dict[str, Any]:
-        """Render each PDF page to an image, read OCR text from each."""
+    def read_text_from_pdf(self, path: str, max_pages: int = 20) -> Dict[str, Any]:
+        """Render every PDF page to an image and read OCR text from each page."""
         model = self.get_available_vision_model()
         if not model:
             return self._no_model_result()
 
         images = self._render_pdf_pages(path, max_pages)
         if not images:
-            return {"error": "Could not render PDF pages to images.",
-                    "raw_text": "", "model": model, "pages_processed": 0}
+            return {
+                "error": "Could not render PDF pages to images.",
+                "raw_text": "", "model": model,
+                "pages_processed": 0, "page_results": [],
+            }
 
         return self._process_pages(images, model)
 
@@ -136,14 +160,13 @@ class VLMService:
     def extract_from_image_file(self, path: str, ext: str) -> Dict[str, Any]:
         return self.read_text_from_image(path, ext)
 
-    def extract_from_pdf(self, path: str, max_pages: int = 10) -> Dict[str, Any]:
+    def extract_from_pdf(self, path: str, max_pages: int = 20) -> Dict[str, Any]:
         return self.read_text_from_pdf(path, max_pages)
 
     # ── Core page processing ───────────────────────────────────────────────────
 
-    def _process_pages(
-        self, page_b64_list: List[str], model: str
-    ) -> Dict[str, Any]:
+    def _process_pages(self, page_b64_list: List[str], model: str) -> Dict[str, Any]:
+        """Call the vision model on each page and accumulate raw text."""
         page_texts:   List[str]  = []
         page_results: List[Dict] = []
         errors:       List[str]  = []
@@ -151,34 +174,48 @@ class VLMService:
         for idx, img_b64 in enumerate(page_b64_list):
             t0       = time.perf_counter()
             page_num = idx + 1
-            text, err = self._call_vision_raw_text(model, img_b64)
-            elapsed  = round((time.perf_counter() - t0) * 1000)
+            logger.info("vlm: processing page %d/%d  model=%s", page_num, len(page_b64_list), model)
+
+            text, err = self._call_vision(model, img_b64)
+            elapsed   = round((time.perf_counter() - t0) * 1000)
 
             if err:
                 errors.append(f"Page {page_num}: {err}")
                 page_results.append({
                     "page": page_num, "status": "error",
-                    "error": err, "duration_ms": elapsed,
+                    "error": err, "duration_ms": elapsed, "chars": 0,
                 })
+                logger.warning("vlm page %d error: %s", page_num, err)
                 continue
 
             page_texts.append(text)
             page_results.append({
-                "page": page_num, "status": "success",
-                "chars": len(text), "duration_ms": elapsed,
-                "preview": text[:200] + ("…" if len(text) > 200 else ""),
+                "page":        page_num,
+                "status":      "success",
+                "chars":       len(text),
+                "duration_ms": elapsed,
+                "preview":     text[:300] + ("…" if len(text) > 300 else ""),
             })
+            logger.info("vlm page %d: %d chars  elapsed=%dms  preview=%s",
+                        page_num, len(text), elapsed, repr(text[:120]))
 
+        # Join pages with a clear page-break separator so the LLM can see page boundaries
         combined = "\n\n--- PAGE BREAK ---\n\n".join(page_texts)
-        return self._finalize(
-            model,
-            raw_text       = combined,
-            pages_processed= len(page_b64_list),
-            page_results   = page_results,
-            errors         = errors,
+
+        logger.info(
+            "vlm: DONE  pages=%d  successful=%d  errors=%d  total_chars=%d",
+            len(page_b64_list), len(page_texts), len(errors), len(combined),
         )
 
-    def _finalize(
+        return self._build_result(
+            model,
+            raw_text        = combined,
+            pages_processed = len(page_b64_list),
+            page_results    = page_results,
+            errors          = errors,
+        )
+
+    def _build_result(
         self,
         model:           str,
         raw_text:        str,
@@ -186,29 +223,27 @@ class VLMService:
         page_results:    List[Dict],
         errors:          Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Run the rule parser on the combined raw text and return full result."""
-        from app.services.timesheet_rule_parser import TimesheetRuleParser
-
-        parsed = TimesheetRuleParser.parse(raw_text)
+        """
+        Return raw OCR result.
+        NO rule-parser, NO JSON extraction — raw text only.
+        The caller (test-lab LLM stage, main pipeline, etc.) handles structuring.
+        """
         return {
             "model":           model,
             "pages_processed": pages_processed,
             "raw_text":        raw_text,
+            "text_chars":      len(raw_text),
             "page_results":    page_results,
             "errors":          errors or [],
-            # Rule-parser fields — promoted to top level for easy access
-            **parsed,
         }
 
     # ── Single-image OCR call ──────────────────────────────────────────────────
 
-    def _call_vision_raw_text(
-        self, model: str, img_b64: str
-    ) -> Tuple[str, Optional[str]]:
-        """Send one image to Ollama with the OCR prompt.
+    def _call_vision(self, model: str, img_b64: str) -> Tuple[str, Optional[str]]:
+        """Send one image to the vision model with the raw OCR prompt.
 
         Returns (raw_text, error_or_None).
-        The VLM is NOT asked to format JSON — just to transcribe the visible text.
+        The VLM is NOT asked to produce JSON — only to transcribe visible text.
         """
         timeout = max(getattr(settings, "LLM_TIMEOUT", 300), 300)
         try:
@@ -221,17 +256,28 @@ class VLMService:
                     "stream":  False,
                     "options": {
                         "temperature": 0,
-                        "num_predict": 4096,
+                        "num_predict": 8192,   # large enough to capture full tables
+                        "num_ctx":     16384,
                     },
                 },
                 timeout=timeout,
             )
             if resp.status_code != 200:
-                return "", f"HTTP {resp.status_code}: {resp.text[:200]}"
+                return "", f"Ollama HTTP {resp.status_code}: {resp.text[:300]}"
             text = resp.json().get("response", "").strip()
+            if not text:
+                return "", "VLM returned an empty response — no visible text found"
             return text, None
+        except httpx.TimeoutException:
+            return "", f"VLM request timed out after {timeout}s"
         except Exception as exc:
             return "", str(exc)
+
+    # ── Backward-compat alias ──────────────────────────────────────────────────
+
+    def _call_vision_raw_text(self, model: str, img_b64: str) -> Tuple[str, Optional[str]]:
+        """Alias kept for callers that used the old method name."""
+        return self._call_vision(model, img_b64)
 
     # ── Image helpers ──────────────────────────────────────────────────────────
 
@@ -247,17 +293,18 @@ class VLMService:
             return base64.b64encode(buf.getvalue()).decode()
 
     @staticmethod
-    def _render_pdf_pages(path: str, max_pages: int = 10) -> List[str]:
+    def _render_pdf_pages(path: str, max_pages: int = 20) -> List[str]:
+        """Render all PDF pages as base64 PNG strings."""
         try:
             import fitz
-            import io
             doc    = fitz.open(path)
             n      = min(len(doc), max_pages)
+            logger.info("vlm: rendering %d/%d PDF pages at %d DPI", n, len(doc), PDF_RENDER_DPI)
             result = []
             for i in range(n):
-                page     = doc[i]
-                mat      = fitz.Matrix(PDF_RENDER_DPI / 72, PDF_RENDER_DPI / 72)
-                pix      = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                page = doc[i]
+                mat  = fitz.Matrix(PDF_RENDER_DPI / 72, PDF_RENDER_DPI / 72)
+                pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
                 result.append(base64.b64encode(pix.tobytes("png")).decode())
             doc.close()
             return result
@@ -273,11 +320,14 @@ class VLMService:
             "ensure Ollama is running with OLLAMA_HOST=0.0.0.0:11434"
         )
         return {
-            "error":           f"No vision model found in Ollama. {hint}. "
-                               "Pull one with: ollama pull llava:7b",
+            "error":           (
+                f"No vision model found in Ollama. {hint}. "
+                "Pull one with: ollama pull qwen2.5vl:7b"
+            ),
             "raw_text":        "",
-            "entries":         [],
-            "entries_found":   0,
+            "text_chars":      0,
             "model":           None,
             "pages_processed": 0,
+            "page_results":    [],
+            "errors":          [],
         }

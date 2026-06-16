@@ -1,7 +1,7 @@
 """Pydantic schemas for validation errors."""
 from __future__ import annotations
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any, Dict
 from pydantic import BaseModel
 
 
@@ -36,5 +36,16 @@ class ValidationListResponse(BaseModel):
     info_count: int
 
 
+class CorrectionPayload(BaseModel):
+    """Fields the HR reviewer can fill in to fix the underlying data."""
+    employee_name: Optional[str] = None   # correct the detected name
+    employee_id: Optional[str] = None     # assign a specific employee
+    hours: Optional[float] = None         # fix hours on an entry
+    date: Optional[str] = None            # fix the work date (ISO)
+    notes: Optional[str] = None           # free-text note
+
+
 class ResolveValidationRequest(BaseModel):
     resolution_note: Optional[str] = None
+    resolved_by_name: Optional[str] = None   # HR reviewer's name for audit trail
+    correction: Optional[CorrectionPayload] = None
