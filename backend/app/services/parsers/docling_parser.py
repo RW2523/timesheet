@@ -11,13 +11,16 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_docling_converter = None
+# Two cached converters: one layout-only (fast), one OCR-enabled (for scanned
+# pages).  OCR adds Docling's TableFormer on top of recognized text, which is
+# the best table-preserving path we have for scanned timesheets.
+_docling_converters: dict = {}
 
 
-def _get_converter():
+def _get_converter(ocr: bool = False):
     """Lazy-init Docling converter. Downloads models on first use to /storage/docling_models."""
-    global _docling_converter
-    if _docling_converter is None:
+    key = "ocr" if ocr else "layout"
+    if key not in _docling_converters:
         try:
             import os
 
@@ -35,18 +38,16 @@ def _get_converter():
             import torch
 
             use_gpu = torch.cuda.is_available()
-            logger.info(f"Docling: initializing (GPU={'yes' if use_gpu else 'no/CPU'}, cache={hf_home})")
+            logger.info(f"Docling: initializing ocr={ocr} (GPU={'yes' if use_gpu else 'no/CPU'}, cache={hf_home})")
 
-            # do_ocr=False — we use our own PaddleOCR/Tesseract pipeline for scanned docs
-            # Docling focuses on layout analysis and table structure extraction
             pipeline_options = PdfPipelineOptions(
-                do_ocr=False,
+                do_ocr=ocr,
                 do_table_structure=True,
             )
             pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
             pipeline_options.table_structure_options.do_cell_matching = True
 
-            _docling_converter = DocumentConverter(
+            _docling_converters[key] = DocumentConverter(
                 format_options={
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
                 }
@@ -54,12 +55,13 @@ def _get_converter():
             logger.info("Docling converter initialized successfully (models will auto-download)")
         except ImportError:
             logger.warning("Docling not installed — skipping Docling extraction")
-            _docling_converter = "unavailable"
+            _docling_converters[key] = "unavailable"
         except Exception as e:
             logger.error(f"Docling init failed: {e}")
-            _docling_converter = "unavailable"
+            _docling_converters[key] = "unavailable"
 
-    return None if _docling_converter == "unavailable" else _docling_converter
+    conv = _docling_converters.get(key)
+    return None if conv == "unavailable" else conv
 
 
 class DoclingParser:
@@ -77,8 +79,10 @@ class DoclingParser:
     }
     """
 
-    def parse(self, file_path: str) -> Optional[Dict[str, Any]]:
-        converter = _get_converter()
+    def parse(self, file_path: str, ocr: Optional[bool] = None) -> Optional[Dict[str, Any]]:
+        if ocr is None:
+            ocr = bool(getattr(settings, "DOCLING_OCR", False))
+        converter = _get_converter(ocr=ocr)
         if converter is None:
             return None
 
@@ -133,9 +137,10 @@ class DoclingParser:
                     if df.empty:
                         continue
                     # First row is header
-                    rows = [list(df.columns)]
+                    import pandas as _pd
+                    rows = [[str(c) for c in df.columns]]
                     for _, row in df.iterrows():
-                        rows.append([str(v) if v is not None else "" for v in row])
+                        rows.append(["" if _pd.isna(v) else str(v) for v in row])
                     if len(rows) > 1:
                         tables.append({
                             "sheet": f"table_{table_idx + 1}",

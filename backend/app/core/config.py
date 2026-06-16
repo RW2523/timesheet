@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     PRIMARY_LLM_MODEL: str = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4"
     LLM_TIMEOUT: int = 180
 
+    # LLM — structured output / validation
+    # When true, the extractor asks the model for schema-constrained JSON
+    # (Ollama `format`, OpenAI/TRT `response_format`) and validates the result
+    # with Pydantic, retrying once on a schema failure before giving up.
+    LLM_STRUCTURED_OUTPUT: bool = True
+    LLM_VALIDATE_RETRIES: int = 1
+    # The verification ("second opinion") pass can mutate good extractions; off by default.
+    LLM_VERIFY_PASS: bool = False
+
+    # Date locale: False -> MM/DD (US); True -> DD/MM (EU). Applies to ambiguous dates only.
+    DATE_DAYFIRST: bool = False
+
     # OCR
     OCR_ENABLED: bool = True
     OCR_USE_GPU: bool = False
@@ -53,15 +65,23 @@ class Settings(BaseSettings):
     # Docling
     DOCLING_ENABLED: bool = True
     DOCLING_ARTIFACTS_PATH: str = "/storage/docling_models"
+    # Enable Docling's own OCR (TableFormer) for scanned PDFs/images. Preserves
+    # table structure far better than flat OCR text, at a speed cost.
+    DOCLING_OCR: bool = False
 
     # App
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"
     ALLOWED_ORIGINS: str = "*"
+    # Optional API-key gate. When empty, the API is open (local/Tailscale use).
+    # When set, every /api request must send `X-API-Key: <value>`.
+    API_KEY: Optional[str] = None
 
     # Payroll rules
     REGULAR_DAILY_LIMIT_HOURS: float = 8.0
     REGULAR_WEEKLY_LIMIT_HOURS: float = 40.0
+    # Reclassify regular hours above the weekly limit (Mon–Sun) into overtime.
+    WEEKLY_OVERTIME_ENABLED: bool = True
     MAX_DAILY_HOURS: float = 16.0
     LATE_SUBMISSION_DAYS: int = 5
     INACTIVE_MONTHS_THRESHOLD: int = 2

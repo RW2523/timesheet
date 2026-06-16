@@ -108,11 +108,11 @@ class ReportService:
 
         files = self.db.query(UploadedFile).filter(UploadedFile.batch_id == batch_id).all()
         for r, f in enumerate(files, 2):
-            ws.cell(r, 1, f.folder_path or "")
-            ws.cell(r, 2, f.file_name)
+            ws.cell(r, 1, self._san(f.folder_path or ""))
+            ws.cell(r, 2, self._san(f.file_name))
             ws.cell(r, 3, f.file_ext or "")
             ws.cell(r, 4, round((f.file_size_bytes or 0) / 1024, 1))
-            ws.cell(r, 5, f.detected_employee_name or "")
+            ws.cell(r, 5, self._san(f.detected_employee_name or ""))
             ws.cell(r, 6, f.matched_employee_id or "")
             ws.cell(r, 7, f.match_status)
             ws.cell(r, 8, "Yes" if f.ocr_required else "No")
@@ -194,7 +194,7 @@ class ReportService:
             ws.cell(r, 2, e.rule_code)
             ws.cell(r, 3, str(e.employee_id) if e.employee_id else "")
             ws.cell(r, 4, str(e.file_id) if e.file_id else "")
-            ws.cell(r, 5, e.message)
+            ws.cell(r, 5, self._san(e.message))
             ws.cell(r, 6, e.expected_value or "")
             ws.cell(r, 7, e.actual_value or "")
             ws.cell(r, 8, e.action_required or "")
@@ -229,7 +229,7 @@ class ReportService:
             leave_days = sum(1 for e in entries if e.entry_type == "LEAVE")
 
             ws.cell(r, 1, sub.employee_id or "")
-            ws.cell(r, 2, emp.full_name if emp else "Unknown")
+            ws.cell(r, 2, self._san(emp.full_name if emp else "Unknown"))
             ws.cell(r, 3, len(entries))
             ws.cell(r, 4, round(total_reg, 2))
             ws.cell(r, 5, round(total_ot, 2))
@@ -268,7 +268,7 @@ class ReportService:
             ready = sum(1 for s in subs if s.payroll_status == "READY")
 
             ws.cell(r, 1, vendor.id)
-            ws.cell(r, 2, vendor.name)
+            ws.cell(r, 2, self._san(vendor.name))
             ws.cell(r, 3, len(subs))
             ws.cell(r, 4, round(total_reg, 2))
             ws.cell(r, 5, round(total_ot, 2))
@@ -299,19 +299,8 @@ class ReportService:
             total_reg = sum(float(e.regular_hours or 0) for e in entries)
             total_ot = sum(float(e.overtime_hours or 0) for e in entries)
 
-            # Get rate
-            from app.db.models import EmployeeRate
-            from datetime import date
-            today = date.today()
-            rate = (
-                self.db.query(EmployeeRate)
-                .filter(
-                    EmployeeRate.employee_id == sub.employee_id,
-                    EmployeeRate.effective_start_date <= today,
-                )
-                .order_by(EmployeeRate.effective_start_date.desc())
-                .first()
-            )
+            # Rate effective during the worked period (consistent with PayrollService)
+            rate = self._rate_for(sub)
 
             reg_rate = float(rate.regular_rate) if rate else None
             ot_rate = float(rate.overtime_rate) if rate and rate.overtime_rate else (reg_rate * 1.5 if reg_rate else None)
@@ -320,7 +309,7 @@ class ReportService:
             total_pay = round((reg_pay or 0) + (ot_pay or 0), 2) if reg_pay is not None else None
 
             ws.cell(r, 1, sub.employee_id or "")
-            ws.cell(r, 2, emp.full_name if emp else "Unknown")
+            ws.cell(r, 2, self._san(emp.full_name if emp else "Unknown"))
             ws.cell(r, 3, round(total_reg, 2))
             ws.cell(r, 4, round(total_ot, 2))
             ws.cell(r, 5, reg_rate or "MISSING")
@@ -365,24 +354,14 @@ class ReportService:
             total_reg = sum(float(e.regular_hours or 0) for e in entries)
             total_ot = sum(float(e.overtime_hours or 0) for e in entries)
 
-            from app.db.models import EmployeeRate
-            from datetime import date
-            rate = (
-                self.db.query(EmployeeRate)
-                .filter(
-                    EmployeeRate.employee_id == sub.employee_id,
-                    EmployeeRate.effective_start_date <= date.today(),
-                )
-                .order_by(EmployeeRate.effective_start_date.desc())
-                .first()
-            )
+            rate = self._rate_for(sub)
             reg_rate = float(rate.regular_rate) if rate else 0.0
             ot_rate = float(rate.overtime_rate) if rate and rate.overtime_rate else reg_rate * 1.5
             reg_pay = round(total_reg * reg_rate, 2)
             ot_pay = round(total_ot * ot_rate, 2)
 
-            ws.cell(r, 1, emp.employee_code if emp and emp.employee_code else str(emp.id)[:8] if emp else "")
-            ws.cell(r, 2, emp.full_name if emp else "")
+            ws.cell(r, 1, self._san(emp.employee_code if emp and emp.employee_code else str(emp.id)[:8] if emp else ""))
+            ws.cell(r, 2, self._san(emp.full_name if emp else ""))
             ws.cell(r, 3, str(sub.timesheet_start_date) if sub.timesheet_start_date else "")
             ws.cell(r, 4, str(sub.timesheet_end_date) if sub.timesheet_end_date else "")
             ws.cell(r, 5, round(total_reg, 2))
@@ -404,6 +383,37 @@ class ReportService:
             cell.fill = HEADER_FILL
             cell.font = HEADER_FONT
             cell.alignment = Alignment(horizontal="center")
+
+    @staticmethod
+    def _san(value):
+        """Neutralize CSV/Excel formula injection.
+
+        A cell whose text starts with = + - @ (or a control char) is treated as a
+        live formula by Excel/Sheets.  Prefix such strings with a single quote so a
+        crafted filename or extracted name can't execute on open.
+        """
+        if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + value
+        return value
+
+    def _rate_for(self, sub):
+        """Pay rate effective during the submission's worked period (not today)."""
+        from app.db.models import EmployeeRate
+        from datetime import date as _date
+        as_of = sub.timesheet_end_date or sub.timesheet_start_date or _date.today()
+        return (
+            self.db.query(EmployeeRate)
+            .filter(
+                EmployeeRate.employee_id == sub.employee_id,
+                EmployeeRate.effective_start_date <= as_of,
+            )
+            .filter(
+                (EmployeeRate.effective_end_date.is_(None))
+                | (EmployeeRate.effective_end_date >= as_of)
+            )
+            .order_by(EmployeeRate.effective_start_date.desc())
+            .first()
+        )
 
     @staticmethod
     def _fill_row(ws, row: int, num_cols: int, fill) -> None:
@@ -457,10 +467,6 @@ class ReportService:
                 )
 
                 # Raw extraction for confidence/entry count
-                raw = (
-                    self.db.query(self.db.query(type(None)).join).__class__  # placeholder
-                    if False else None
-                )
                 from app.db.models import RawExtraction
                 raw = (
                     self.db.query(RawExtraction)
@@ -563,11 +569,11 @@ class ReportService:
                             warning_count += 1
 
                 rows.append({
-                    "File Name": f.file_name,
-                    "Folder Path": f.folder_path or "",
+                    "File Name": self._san(f.file_name),
+                    "Folder Path": self._san(f.folder_path or ""),
                     "Document Type": f.processing_status or "",
-                    "Employee Candidate": f.detected_employee_name or "",
-                    "Matched Employee": emp.full_name if emp else "",
+                    "Employee Candidate": self._san(f.detected_employee_name or ""),
+                    "Matched Employee": self._san(emp.full_name if emp else ""),
                     "Match Status": f.match_status or "",
                     "Match Confidence": f"{float(f.match_confidence or 0):.0%}" if f.match_confidence else "",
                     "Extraction Method": extraction_method,
@@ -585,7 +591,7 @@ class ReportService:
                     "Warning Count": warning_count,
                     "OCR Used": "Yes" if f.ocr_required else "No",
                     "Duplicate": "Yes" if f.is_duplicate else "No",
-                    "Notes": " | ".join(notes_parts) if notes_parts else "OK",
+                    "Notes": self._san(" | ".join(notes_parts) if notes_parts else "OK"),
                 })
 
             # Build CSV in memory

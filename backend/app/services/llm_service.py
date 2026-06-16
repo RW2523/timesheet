@@ -27,7 +27,10 @@ import textwrap
 import uuid
 from typing import Optional, Dict, Any
 
+from pydantic import ValidationError
+
 from app.core.config import settings
+from app.schemas.extraction import TimesheetExtraction, timesheet_extraction_schema
 
 logger = logging.getLogger(__name__)
 
@@ -361,48 +364,76 @@ class LLMService:
             if len(text) > 12000:
                 logger.info("[LLM:%s] sending full text: %d chars (no cap)", call_id, len(text))
 
-        prompt = EXTRACTION_PROMPT_TEMPLATE.format(raw_text=text)
-        _dbg(call_id, "EXTRACTION PROMPT SENT", prompt, _DBG_PROMPT_CHARS)
+        base_prompt = EXTRACTION_PROMPT_TEMPLATE.format(raw_text=text)
+        schema = timesheet_extraction_schema() if settings.LLM_STRUCTURED_OUTPUT else None
 
-        result = self._call_with_fallback(prompt, call_id=call_id, step="extraction")
-        if not result:
-            logger.error("[LLM:%s] FAILED — all backends returned empty for extraction", call_id)
-            return None
+        # Schema-constrained call + validation, with a corrective retry.  A bad
+        # response no longer kills the document silently — we re-ask once with the
+        # validation error before giving up.
+        parsed: Optional[Dict[str, Any]] = None
+        max_attempts = 1 + max(0, int(getattr(settings, "LLM_VALIDATE_RETRIES", 1)))
+        prompt = base_prompt
+        for attempt in range(1, max_attempts + 1):
+            _dbg(call_id, f"EXTRACTION PROMPT SENT (attempt {attempt})", prompt, _DBG_PROMPT_CHARS)
+            result = self._call_with_fallback(prompt, call_id=call_id, step="extraction", schema=schema)
+            if not result:
+                logger.error("[LLM:%s] FAILED — all backends returned empty for extraction", call_id)
+                return None
+            _dbg(call_id, f"EXTRACTION RAW RESPONSE (attempt {attempt})", result)
 
-        _dbg(call_id, "EXTRACTION RAW RESPONSE", result)
+            raw_parsed = self._parse_json(result)
+            err_msg = None
+            if not raw_parsed:
+                err_msg = "Response was not valid JSON."
+            else:
+                try:
+                    parsed = TimesheetExtraction.model_validate(raw_parsed).model_dump()
+                    break
+                except ValidationError as ve:
+                    err_msg = ve.errors(include_url=False, include_input=False).__str__()[:600]
 
-        parsed = self._parse_json(result)
+            logger.warning("[LLM:%s] EXTRACTION attempt %d/%d invalid: %s",
+                           call_id, attempt, max_attempts, err_msg)
+            if attempt < max_attempts:
+                prompt = (
+                    base_prompt
+                    + "\n\nYour previous answer was rejected: "
+                    + (err_msg or "invalid JSON")
+                    + "\nReturn ONLY a single JSON object matching the schema exactly. No prose, no markdown."
+                )
+
         if not parsed:
-            logger.warning("[LLM:%s] PARSE FAILED — could not extract JSON from response\n"
-                           "  raw (first 500 chars): %s", call_id, result[:500])
-            return None
-
-        if not isinstance(parsed.get("entries"), list):
-            logger.warning("[LLM:%s] SCHEMA ERROR — 'entries' missing or not a list\n"
-                           "  parsed keys: %s", call_id, list(parsed.keys()))
+            logger.warning("[LLM:%s] PARSE/VALIDATION FAILED after %d attempts", call_id, max_attempts)
             return None
 
         logger.info("[LLM:%s] EXTRACTION OK — %d entries  employee=%s",
                     call_id, len(parsed["entries"]), parsed.get("employee_name"))
         _dbg(call_id, "EXTRACTION PARSED JSON", json.dumps(parsed, indent=2))
 
-        # Verification pass
-        if verify and parsed.get("entries"):
+        # Verification pass (off by default — it can mutate good extractions)
+        if verify and settings.LLM_VERIFY_PASS and parsed.get("entries"):
             logger.debug("[LLM:%s] Starting verification pass", call_id)
             try:
                 # Pass source text into verification so LLM has ground truth.
-                # Use a short slice of source (first 6000 chars) to stay within context.
-                src_for_verify = (source_text or raw_text)[:6000]
+                # Never feed it TRUNCATED JSON — that makes it "fix" entries it
+                # cannot see and corrupt good data.
+                src_for_verify = (source_text or raw_text)
                 verify_prompt = VERIFICATION_PROMPT_TEMPLATE.format(
                     source_text=src_for_verify,
-                    extracted_json=json.dumps(parsed, indent=2)[:6000],
+                    extracted_json=json.dumps(parsed, indent=2),
                 )
                 _dbg(call_id, "VERIFICATION PROMPT SENT", verify_prompt, _DBG_PROMPT_CHARS)
 
-                verified_raw = self._call_with_fallback(verify_prompt, call_id=call_id, step="verification")
+                verified_raw = self._call_with_fallback(
+                    verify_prompt, call_id=call_id, step="verification", schema=schema)
                 if verified_raw:
                     _dbg(call_id, "VERIFICATION RAW RESPONSE", verified_raw)
                     verified = self._parse_json(verified_raw)
+                    if verified:
+                        try:
+                            verified = TimesheetExtraction.model_validate(verified).model_dump()
+                        except ValidationError:
+                            verified = None
                     if verified and isinstance(verified.get("entries"), list):
                         before, after = len(parsed["entries"]), len(verified["entries"])
                         # Safety guard: do NOT let verification remove entries
@@ -427,8 +458,13 @@ class LLMService:
                     len(parsed.get("entries", [])), parsed.get("employee_name"))
         return parsed
 
-    def _call_with_fallback(self, prompt: str, call_id: str = "", step: str = "") -> Optional[str]:
-        """Call configured provider, then fall back to next available."""
+    def _call_with_fallback(self, prompt: str, call_id: str = "", step: str = "",
+                            schema: Optional[dict] = None) -> Optional[str]:
+        """Call configured provider, then fall back to next available.
+
+        ``schema`` (a JSON Schema dict) constrains the model to structured JSON
+        output when the provider supports it.
+        """
         provider = settings.LLM_PROVIDER.lower()
         tag = f"{step}/" if step else ""
 
@@ -437,20 +473,20 @@ class LLMService:
         if provider == "mock":
             return self._call_mock()
         if provider == "ollama":
-            result = self._call_ollama(prompt, call_id=call_id, step=step)
+            result = self._call_ollama(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "ollama"
                 return result
-            result = self._call_trt_llm(prompt, call_id=call_id, step=step)
+            result = self._call_trt_llm(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "tensorrt_llm"
                 return result
         elif provider == "tensorrt_llm":
-            result = self._call_trt_llm(prompt, call_id=call_id, step=step)
+            result = self._call_trt_llm(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "tensorrt_llm"
                 return result
-            result = self._call_ollama(prompt, call_id=call_id, step=step)
+            result = self._call_ollama(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "ollama"
                 return result
@@ -458,13 +494,13 @@ class LLMService:
             if not settings.ALLOW_CLOUD_LLM:
                 logger.warning("[LLM:%s] OpenAI provider configured but ALLOW_CLOUD_LLM=false", call_id)
                 return None
-            result = self._call_openai(prompt, call_id=call_id, step=step)
+            result = self._call_openai(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "openai"
                 return result
 
         if settings.ALLOW_CLOUD_LLM and settings.OPENAI_API_KEY:
-            result = self._call_openai(prompt, call_id=call_id, step=step)
+            result = self._call_openai(prompt, call_id=call_id, step=step, schema=schema)
             if result:
                 self._active_backend = "openai"
                 return result
@@ -484,7 +520,7 @@ class LLMService:
         })
 
     def _call_ollama(self, prompt: str, call_id: str = "", step: str = "",
-                     system_prompt: str = "") -> Optional[str]:
+                     system_prompt: str = "", schema: Optional[dict] = None) -> Optional[str]:
         """Call Ollama API. Tries preferred model, then fallback model."""
         base_url      = settings.OLLAMA_BASE_URL
         models_to_try = [settings.OLLAMA_MODEL, settings.OLLAMA_FALLBACK_MODEL]
@@ -492,8 +528,8 @@ class LLMService:
         for model in models_to_try:
             try:
                 import httpx
-                logger.debug("[LLM:%s] ollama/%s → POST %s/api/generate  model=%s  prompt_chars=%d",
-                             call_id, step, base_url, model, len(prompt))
+                logger.debug("[LLM:%s] ollama/%s → POST %s/api/generate  model=%s  prompt_chars=%d  schema=%s",
+                             call_id, step, base_url, model, len(prompt), bool(schema))
                 payload: dict = {
                     "model": model,
                     # /no_think prefix suppresses <think> blocks on reasoning models
@@ -506,6 +542,9 @@ class LLMService:
                         "num_ctx":     32768,  # context window — fits full timesheets
                     },
                 }
+                # Constrain output to the JSON schema when requested (Ollama >= 0.5).
+                if schema:
+                    payload["format"] = schema
                 if system_prompt:
                     payload["system"] = system_prompt
                 response = httpx.post(
@@ -533,7 +572,8 @@ class LLMService:
 
         return None
 
-    def _call_trt_llm(self, prompt: str, call_id: str = "", step: str = "") -> Optional[str]:
+    def _call_trt_llm(self, prompt: str, call_id: str = "", step: str = "",
+                      schema: Optional[dict] = None) -> Optional[str]:
         """Call TRT-LLM on DGX Spark via OpenAI-compatible /v1/chat/completions endpoint."""
         if not settings.LLM_BASE_URL:
             return None
@@ -541,14 +581,17 @@ class LLMService:
             import httpx
             logger.debug("[LLM:%s] trtllm/%s → POST %s/chat/completions  prompt_chars=%d",
                          call_id, step, settings.LLM_BASE_URL, len(prompt))
+            body: dict = {
+                "model":       settings.PRIMARY_LLM_MODEL,
+                "messages":    [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens":  4096,
+            }
+            if schema:
+                body["response_format"] = {"type": "json_object"}
             response = httpx.post(
                 f"{settings.LLM_BASE_URL}/chat/completions",
-                json={
-                    "model":       settings.PRIMARY_LLM_MODEL,
-                    "messages":    [{"role": "user", "content": prompt}],
-                    "temperature": 0.0,
-                    "max_tokens":  4096,
-                },
+                json=body,
                 timeout=settings.LLM_TIMEOUT,
             )
             logger.debug("[LLM:%s] trtllm/%s ← HTTP %d", call_id, step, response.status_code)
@@ -565,7 +608,8 @@ class LLMService:
             logger.warning("[LLM:%s] trtllm exception: %s", call_id, exc)
         return None
 
-    def _call_openai(self, prompt: str, call_id: str = "", step: str = "") -> Optional[str]:
+    def _call_openai(self, prompt: str, call_id: str = "", step: str = "",
+                     schema: Optional[dict] = None) -> Optional[str]:
         """Call OpenAI API. Only used when ALLOW_CLOUD_LLM=true and key is set."""
         if not settings.OPENAI_API_KEY:
             return None
@@ -581,12 +625,15 @@ class LLMService:
                 )
             logger.debug("[LLM:%s] openai/%s → model=%s  prompt_chars=%d",
                          call_id, step, settings.OPENAI_MODEL, len(prompt))
-            response = self._openai_client.chat.completions.create(
+            kwargs: dict = dict(
                 model=settings.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=4096,
             )
+            if schema:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = self._openai_client.chat.completions.create(**kwargs)
             raw = response.choices[0].message.content.strip()
             logger.debug("[LLM:%s] openai/%s raw response (%d chars): %s",
                          call_id, step, len(raw),

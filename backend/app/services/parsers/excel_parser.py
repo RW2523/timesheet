@@ -119,10 +119,15 @@ class ExcelParser:
 
     @staticmethod
     def _rows_to_text(rows: List[List]) -> str:
-        """Convert rows to readable pipe-separated text for LLM processing."""
+        """Convert rows to pipe-separated text for LLM processing.
+
+        Empty cells are PRESERVED positionally (rendered as an empty column)
+        so column alignment survives — dropping blanks shifts every following
+        cell left and destroys date/in/out/hours column meaning.
+        """
         lines = []
         for row in rows:
-            parts = [str(c) for c in row if str(c).strip()]
-            if parts:
-                lines.append(" | ".join(parts))
+            cells = [str(c).strip() for c in row]
+            if any(cells):  # skip fully-empty rows only
+                lines.append(" | ".join(cells))
         return "\n".join(lines)

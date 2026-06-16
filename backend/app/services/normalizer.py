@@ -612,11 +612,10 @@ class NormalizerService:
 
     @staticmethod
     def _parse_date(val: str) -> Optional[str]:
-        from dateutil import parser as dp
-        try:
-            return dp.parse(str(val), dayfirst=False).strftime("%Y-%m-%d")
-        except Exception:
-            return None
+        # Shared parser honours settings.DATE_DAYFIRST so every layer agrees on
+        # ambiguous dates like 03/04/2026.
+        from app.services.date_utils import parse_date as _pd
+        return _pd(val)
 
     @staticmethod
     def _parse_time(val: str) -> Optional[str]:

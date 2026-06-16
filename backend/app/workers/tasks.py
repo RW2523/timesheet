@@ -106,6 +106,9 @@ def process_batch(self, batch_id: str) -> dict:
                     raw = ocr_svc.process(file_record, raw)
             except Exception as e:
                 logger.warning(f"[{batch_id}] {fname} failed parse/OCR: {e}")
+                # Clear the failed transaction before touching the session again,
+                # otherwise this one file poisons the rest of the phase.
+                db.rollback()
                 inventory_svc.mark_failed(file_record.id, str(e))
 
         _check_cancelled(db, batch_id)
@@ -126,6 +129,7 @@ def process_batch(self, batch_id: str) -> dict:
                 normalizer.normalize(raw_ext)
             except Exception as e:
                 logger.warning(f"[{batch_id}] Normalization failed for {raw_ext.file_id}: {e}")
+                db.rollback()
 
         _check_cancelled(db, batch_id)
         _update_progress(db, batch_id, "Matching employees…")
@@ -139,6 +143,7 @@ def process_batch(self, batch_id: str) -> dict:
                 matcher.match_file(file_record)
             except Exception as e:
                 logger.warning(f"[{batch_id}] Matching failed for {file_record.id}: {e}")
+                db.rollback()
 
         _check_cancelled(db, batch_id)
         _update_progress(db, batch_id, "Creating timesheet entries…")

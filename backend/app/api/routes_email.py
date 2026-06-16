@@ -278,7 +278,7 @@ def list_job_messages(
             is_timesheet=m.is_timesheet,
             classification_reason=m.classification_reason,
             classification_method=m.classification_method,
-            classification_confidence=float(m.classification_confidence) if m.classification_confidence else None,
+            classification_confidence=float(m.classification_confidence) if m.classification_confidence is not None else None,
             has_attachments=bool(m.has_attachments),
             attachments_metadata=m.attachments_metadata,
             processing_status=m.processing_status,

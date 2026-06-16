@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { listEmployees, listVendors, listPayrollPeriods, getInactiveEmployees, clearBatchData, clearAllData } from '@/lib/api'
 import { Settings, Users, Building2, Calendar, AlertOctagon, Plus, Clock, Trash2, ShieldAlert, TriangleAlert, Mail, ExternalLink, RefreshCw, Play, CheckCircle2, XCircle, Loader2, ChevronDown, ChevronRight } from 'lucide-react'
@@ -966,12 +966,14 @@ function ReviewModal({
       })).data,
   })
 
-  // Pre-select all on load
-  useState(() => {
+  // Pre-select all once the messages have actually loaded. (A useState lazy
+  // initializer runs once at mount when messages is still [] — so this must be
+  // an effect keyed on the loaded data.)
+  useEffect(() => {
     if (messages.length > 0) {
       setSelected(new Set(messages.map(m => m.id)))
     }
-  })
+  }, [messages])
 
   const toggleAll = () => {
     if (selected.size === messages.length) setSelected(new Set())

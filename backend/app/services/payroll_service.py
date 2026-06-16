@@ -94,8 +94,10 @@ class PayrollService:
         leave_days = sum(1 for e in entries if e.entry_type == "LEAVE")
         holiday_hours = sum(float(e.calculated_hours or 0) for e in entries if e.is_holiday)
 
-        # Get effective rate for this employee
-        rate = self._get_rate(sub.employee_id)
+        # Get the rate effective during the WORKED period, not today's rate —
+        # otherwise a retroactive run or a post-period rate change pays wrong.
+        as_of = sub.timesheet_end_date or sub.timesheet_start_date or date.today()
+        rate = self._get_rate(sub.employee_id, as_of=as_of)
 
         if rate is None:
             # Missing rate = payroll blocked
@@ -141,17 +143,18 @@ class PayrollService:
             created_at=datetime.utcnow(),
         )
 
-    def _get_rate(self, employee_id: str) -> Optional[EmployeeRate]:
-        today = date.today()
+    def _get_rate(self, employee_id: str, as_of: Optional[date] = None) -> Optional[EmployeeRate]:
+        """Rate effective on ``as_of`` (defaults to today)."""
+        as_of = as_of or date.today()
         return (
             self.db.query(EmployeeRate)
             .filter(
                 EmployeeRate.employee_id == employee_id,
-                EmployeeRate.effective_start_date <= today,
+                EmployeeRate.effective_start_date <= as_of,
             )
             .filter(
                 (EmployeeRate.effective_end_date.is_(None))
-                | (EmployeeRate.effective_end_date >= today)
+                | (EmployeeRate.effective_end_date >= as_of)
             )
             .order_by(EmployeeRate.effective_start_date.desc())
             .first()

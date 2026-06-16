@@ -172,6 +172,7 @@ function IssueDrawer({ issue, batchId, onClose, onResolved }: IssueDrawerProps) 
                       src={previewFileUrl(issue.file_id)}
                       className="w-full h-64 border-0"
                       title="File preview"
+                      sandbox=""
                     />
                   ) : (
                     <div className="text-center text-gray-500 text-sm p-4">

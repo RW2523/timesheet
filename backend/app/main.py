@@ -4,11 +4,12 @@ Ajace TimeSheet AI Bot — FastAPI application entry point.
 from contextlib import asynccontextmanager
 import logging
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.logging_config import setup_logging
+from app.core.security import require_api_key
 from app.db.session import engine
 from app.db.models import Base
 
@@ -46,31 +47,35 @@ app = FastAPI(
 )
 
 _origins = settings.allowed_origins_list
-# When wildcard is configured, we must use allow_origin_regex instead
-# because FastAPI/Starlette disallows allow_credentials=True with ["*"].
 _use_wildcard = _origins == ["*"]
+# Wildcard origins cannot safely be combined with credentials (any site could
+# read authed responses).  The frontend talks to the backend same-origin via a
+# Next.js proxy, so cross-origin credentials aren't needed in the wildcard case.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[] if _use_wildcard else _origins,
-    allow_origin_regex=r".*" if _use_wildcard else None,
-    allow_credentials=True,
+    allow_origins=["*"] if _use_wildcard else _origins,
+    allow_credentials=False if _use_wildcard else True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Optional API-key gate (no-op unless settings.API_KEY is set). Health endpoints
+# below are intentionally left open for probes.
+_auth = [Depends(require_api_key)]
+
 # Register routers
 PREFIX = "/api/v1"
-app.include_router(routes_upload.router, prefix=PREFIX, tags=["upload"])
-app.include_router(routes_batches.router, prefix=PREFIX, tags=["batches"])
-app.include_router(routes_files.router, prefix=PREFIX, tags=["files"])
-app.include_router(routes_entries.router, prefix=PREFIX, tags=["entries"])
-app.include_router(routes_validation.router, prefix=PREFIX, tags=["validation"])
-app.include_router(routes_reports.router, prefix=PREFIX, tags=["reports"])
-app.include_router(routes_payroll.router, prefix=PREFIX, tags=["payroll"])
-app.include_router(routes_approvals.router, prefix=PREFIX, tags=["approvals"])
-app.include_router(routes_admin.router, prefix=PREFIX, tags=["admin"])
-app.include_router(routes_email.router, prefix=PREFIX, tags=["email"])
-app.include_router(routes_debug.router, prefix=PREFIX, tags=["debug"])
+app.include_router(routes_upload.router, prefix=PREFIX, tags=["upload"], dependencies=_auth)
+app.include_router(routes_batches.router, prefix=PREFIX, tags=["batches"], dependencies=_auth)
+app.include_router(routes_files.router, prefix=PREFIX, tags=["files"], dependencies=_auth)
+app.include_router(routes_entries.router, prefix=PREFIX, tags=["entries"], dependencies=_auth)
+app.include_router(routes_validation.router, prefix=PREFIX, tags=["validation"], dependencies=_auth)
+app.include_router(routes_reports.router, prefix=PREFIX, tags=["reports"], dependencies=_auth)
+app.include_router(routes_payroll.router, prefix=PREFIX, tags=["payroll"], dependencies=_auth)
+app.include_router(routes_approvals.router, prefix=PREFIX, tags=["approvals"], dependencies=_auth)
+app.include_router(routes_admin.router, prefix=PREFIX, tags=["admin"], dependencies=_auth)
+app.include_router(routes_email.router, prefix=PREFIX, tags=["email"], dependencies=_auth)
+app.include_router(routes_debug.router, prefix=PREFIX, tags=["debug"], dependencies=_auth)
 
 
 @app.get("/health", tags=["health"])

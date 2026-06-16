@@ -56,7 +56,61 @@ class TimesheetService:
             except Exception as e:
                 logger.error(f"TimesheetService failed for file {file_record.id}: {e}", exc_info=True)
 
+        self.db.flush()
+        self._apply_weekly_overtime(batch_id)
         self.db.commit()
+
+    def _apply_weekly_overtime(self, batch_id: str) -> None:
+        """Reclassify regular hours above the weekly limit into overtime.
+
+        Daily OT (hours > daily limit) is already split per entry; this adds the
+        weekly rule: for OT-allowed vendors, regular hours beyond the weekly limit
+        (Mon–Sun) become overtime, taken from the latest days first.  Without this,
+        e.g. 7×7h = 49h is paid as 49h regular even though weekly OT is owed.
+        """
+        if not getattr(settings, "WEEKLY_OVERTIME_ENABLED", True):
+            return
+
+        subs = (
+            self.db.query(TimesheetSubmission)
+            .filter(TimesheetSubmission.batch_id == batch_id)
+            .all()
+        )
+        default_weekly = float(settings.REGULAR_WEEKLY_LIMIT_HOURS)
+        for sub in subs:
+            vendor = self.db.query(Vendor).filter(Vendor.id == sub.vendor_id).first() if sub.vendor_id else None
+            if vendor and not vendor.overtime_enabled:
+                continue  # non-OT vendors keep everything as regular
+            weekly_limit = float(getattr(vendor, "regular_weekly_limit", None) or default_weekly)
+
+            entries = (
+                self.db.query(TimesheetEntry)
+                .filter(TimesheetEntry.submission_id == sub.id)
+                .all()
+            )
+            weeks: dict = {}
+            for e in entries:
+                if not e.work_date:
+                    continue
+                iso = e.work_date.isocalendar()
+                weeks.setdefault((iso[0], iso[1]), []).append(e)
+
+            for week_entries in weeks.values():
+                total_reg = sum(float(e.regular_hours or 0) for e in week_entries)
+                excess = round(total_reg - weekly_limit, 2)
+                if excess <= 0:
+                    continue
+                # Move the excess from regular to overtime, latest day first.
+                for e in sorted(week_entries, key=lambda x: x.work_date, reverse=True):
+                    if excess <= 0:
+                        break
+                    reg = float(e.regular_hours or 0)
+                    move = min(reg, excess)
+                    if move <= 0:
+                        continue
+                    e.regular_hours = round(reg - move, 2)
+                    e.overtime_hours = round(float(e.overtime_hours or 0) + move, 2)
+                    excess = round(excess - move, 2)
 
     def _process_file(
         self,
@@ -119,7 +173,10 @@ class TimesheetService:
             if not work_date:
                 continue
 
-            # Check for duplicate date for this submission
+            in_time = self._parse_time(entry_data.get("in_time"))
+            out_time = self._parse_time(entry_data.get("out_time"))
+
+            # Check for an existing entry on this date for this submission
             existing = (
                 self.db.query(TimesheetEntry)
                 .filter(
@@ -129,39 +186,48 @@ class TimesheetService:
                 .first()
             )
             if existing:
-                existing_hours = float(existing.calculated_hours or existing.entered_hours or 0)
-                new_hours = float(entry_data.get("hours") or 0)
-                if abs(existing_hours - new_hours) > settings.HOURS_MISMATCH_TOLERANCE:
-                    # Same date, different hours = OVERLAPPING_DATE_CONFLICT (BLOCKER)
-                    self._add_validation_error(
-                        batch_id=batch_id,
-                        file_id=file_record.id,
-                        submission_id=submission.id,
-                        employee_id=file_record.matched_employee_id,
-                        rule_code="OVERLAPPING_DATE_CONFLICT",
-                        severity="BLOCKER",
-                        message=f"Conflicting entries for {work_date}: "
-                                f"existing={existing_hours:.2f}h, new={new_hours:.2f}h",
-                        expected_value=str(existing_hours),
-                        actual_value=str(new_hours),
-                    )
-                else:
-                    # Same date, same hours = DUPLICATE_DATE (WARNING)
-                    self._add_validation_error(
-                        batch_id=batch_id,
-                        file_id=file_record.id,
-                        submission_id=submission.id,
-                        employee_id=file_record.matched_employee_id,
-                        rule_code="DUPLICATE_DATE",
-                        severity="WARNING",
-                        message=f"Duplicate entry for date {work_date} (same hours — possibly the same file processed twice)",
-                        actual_value=str(work_date),
-                    )
-                continue
+                # A genuine second shift has its own distinct in/out window — keep it
+                # as an additional entry rather than dropping it.
+                is_distinct_shift = bool(
+                    in_time and out_time and existing.in_time and existing.out_time
+                    and (in_time != existing.in_time or out_time != existing.out_time)
+                )
+                if not is_distinct_shift:
+                    existing_hours = float(existing.calculated_hours or existing.entered_hours or 0)
+                    new_hours = float(entry_data.get("hours") or 0)
+                    if abs(existing_hours - new_hours) > settings.HOURS_MISMATCH_TOLERANCE:
+                        # Same date, different hours = OVERLAPPING_DATE_CONFLICT (BLOCKER)
+                        self._add_validation_error(
+                            batch_id=batch_id,
+                            file_id=file_record.id,
+                            submission_id=submission.id,
+                            employee_id=file_record.matched_employee_id,
+                            rule_code="OVERLAPPING_DATE_CONFLICT",
+                            severity="BLOCKER",
+                            message=f"Conflicting entries for {work_date}: "
+                                    f"existing={existing_hours:.2f}h, new={new_hours:.2f}h",
+                            expected_value=str(existing_hours),
+                            actual_value=str(new_hours),
+                        )
+                    else:
+                        # Same date, same hours = DUPLICATE_DATE (WARNING)
+                        self._add_validation_error(
+                            batch_id=batch_id,
+                            file_id=file_record.id,
+                            submission_id=submission.id,
+                            employee_id=file_record.matched_employee_id,
+                            rule_code="DUPLICATE_DATE",
+                            severity="WARNING",
+                            message=f"Duplicate entry for date {work_date} (same hours — possibly the same file processed twice)",
+                            actual_value=str(work_date),
+                        )
+                    continue
+                # else: fall through and insert the second shift as its own entry
 
-            in_time = self._parse_time(entry_data.get("in_time"))
-            out_time = self._parse_time(entry_data.get("out_time"))
-            break_min = int(entry_data.get("break_minutes") or 0)
+            try:
+                break_min = int(round(float(entry_data.get("break_minutes") or 0)))
+            except (ValueError, TypeError):
+                break_min = 0
             entered_hours = entry_data.get("hours")
             if entered_hours is not None:
                 try:
@@ -221,8 +287,11 @@ class TimesheetService:
                     expected_value="0",
                     actual_value=str(ot_h),
                 )
-                # For non-OT vendors treat all hours as regular for payroll safety
-                regular_h = calculated_hours or 0.0
+                # For non-OT vendors treat all hours as regular for payroll safety.
+                # Use the SAME authoritative figure chosen above (payroll_hours),
+                # not calculated_hours — otherwise a mismatched entry silently
+                # reverts to the system calc and contradicts the safety rule.
+                regular_h = payroll_hours or 0.0
                 ot_h = 0.0
 
             entry = TimesheetEntry(
@@ -393,14 +462,16 @@ class TimesheetService:
     def _parse_date(val) -> Optional[date]:
         if not val:
             return None
-        if str(val).startswith("INVALID_"):
+        if isinstance(val, date):
+            return val
+        # Shared parser honours settings.DATE_DAYFIRST (consistent with normalizer).
+        from app.services.date_utils import parse_date as _pd
+        iso = _pd(val)
+        if not iso:
             return None
         try:
-            if isinstance(val, date):
-                return val
-            from dateutil import parser as dp
-            return dp.parse(str(val)).date()
-        except Exception:
+            return date.fromisoformat(iso)
+        except ValueError:
             return None
 
     @staticmethod

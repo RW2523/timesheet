@@ -144,6 +144,7 @@ export default function FilesPage({ params }: Props) {
                 src={previewFileUrl(previewFile.id)}
                 className="w-full h-full border-0 min-h-[70vh]"
                 title={previewFile.name}
+                sandbox=""
               />
             </div>
           </div>

@@ -45,10 +45,10 @@ VISION_MODEL_CANDIDATES = [
 # It MUST NOT invent values, add JSON, or summarise — only transcribe.
 
 OCR_PROMPT = """\
-You are an OCR scanner reading a document image.
+You are an OCR scanner reading a timesheet document image.
 
-YOUR ONLY JOB: output every piece of text you can see in this image, \
-exactly as it appears, line by line.
+YOUR JOB: transcribe every piece of text you can see, exactly as it appears, \
+and — critically — REPRODUCE TABLES AS TABLES so the column structure survives.
 
 INCLUDE ALL OF THE FOLLOWING:
 - Company / employer name, logo text, header lines
@@ -61,17 +61,20 @@ INCLUDE ALL OF THE FOLLOWING:
 - Footer lines, certification text, signature labels, approval text, \
   approval dates, status fields
 
+TABLE RULES (most important):
+- Output every table as a GitHub-style Markdown table using pipes (|).
+- Keep the header row, then one line per data row.
+- Preserve the EXACT column order, one cell per column.
+- If a cell is empty, still emit the empty column (`| |`) so columns stay aligned.
+- Do NOT merge two columns into one and do NOT split one row across multiple lines.
+
 DO NOT:
-- Add commentary, explanations, or section headings that are not in the image
-- Invent or guess any value you cannot clearly see
-- Skip any line, row, or column — even if it looks blank or repetitive
-- Format as JSON, XML, or any structured format
+- Add commentary, explanations, or headings that are not in the image
+- Invent or guess any value you cannot clearly see (leave the cell blank instead)
+- Skip any row or column
 - Summarise or paraphrase
 
-OUTPUT FORMAT:
-Reproduce the text exactly as it appears, preserving line breaks. \
-Use a single blank line between distinct visual sections if helpful. \
-Do not add any other markup.
+Output the non-table text as plain lines, and every table as a Markdown table.
 """
 
 

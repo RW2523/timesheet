@@ -1,5 +1,5 @@
 'use client'
-import { useState, useCallback, useRef, useEffect } from 'react'
+import { Fragment, useState, useCallback, useRef, useEffect } from 'react'
 import axios from 'axios'
 import {
   Upload, ChevronRight, CheckCircle2, XCircle, Loader2,
@@ -78,6 +78,13 @@ interface BenchmarkResult {
   session_id: string; parser_used: string; models_run: number
   results: BenchResult[]; best_model: string | null; duration_ms: number
 }
+// Live per-model state during a benchmark run. Was referenced in 8 places but
+// never declared — broke `next build` under strict mode.
+interface ModelRunStatus {
+  state: 'pending' | 'running' | 'done' | 'error'
+  result?: BenchResult
+  error?: string
+}
 
 const ROLE_COLORS: Record<string, string> = {
   primary:      'bg-indigo-100 text-indigo-700',
@@ -139,12 +146,20 @@ export default function TestLabPage() {
   // Live per-model status during a benchmark run
   const [modelRunStatus, setModelRunStatus] = useState<Record<string, ModelRunStatus>>({})
 
+  // Aborts the in-flight streaming fetch (run-llm / benchmark) on reset/unmount
+  // so we don't leak the reader or setState on an unmounted component.
+  const abortRef = useRef<AbortController | null>(null)
+
   const reset = () => {
+    abortRef.current?.abort()
     setStep(1); setUploadResult(null); setParserResults({})
     setRunningParser(null); setSelectedParser(null); setViewingParser(null)
     setLLMResult(null); setRunningLLM(false); setLlmProgress('')
     setBenchResult(null); setRunningBench(false); setModelRunStatus({})
   }
+
+  // Abort any in-flight stream when the component unmounts.
+  useEffect(() => () => abortRef.current?.abort(), [])
 
   // Load model catalog on mount
   useEffect(() => {
@@ -216,6 +231,8 @@ export default function TestLabPage() {
     const pr = parserResults[selectedParser]
     if (!pr || !pr.text) return
     _llmInFlight.current = true
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
     setRunningLLM(true); setStep(3); setLLMResult(null); setBenchResult(null)
     setLlmProgress('Starting extraction…')
     try {
@@ -229,6 +246,7 @@ export default function TestLabPage() {
             parser_used: selectedParser,
             period_filter: { month: periodMonth, year: periodYear },
           }),
+          signal: abortRef.current.signal,
           // no timeout — LLM can take many minutes for large docs
         }
       )
@@ -263,9 +281,11 @@ export default function TestLabPage() {
         }
       }
     } catch (e: any) {
-      setLLMResult({ status: 'error', duration_ms: 0, provider: '', model: '',
-        entries: [], summary: {}, prompt_preview: '',
-        error: e.message })
+      if (e?.name !== 'AbortError') {
+        setLLMResult({ status: 'error', duration_ms: 0, provider: '', model: '',
+          entries: [], summary: {}, prompt_preview: '',
+          error: e.message })
+      }
       setLlmProgress('')
     } finally { setRunningLLM(false); _llmInFlight.current = false }
   }
@@ -329,6 +349,8 @@ export default function TestLabPage() {
     if (selectedModels.size === 0) { alert('Select at least one model'); return }
 
     _benchInFlight.current = true
+    abortRef.current?.abort()
+    abortRef.current = new AbortController()
     setRunningBench(true)
     setStep(3)
     setBenchResult(null)
@@ -351,7 +373,7 @@ export default function TestLabPage() {
             models: Array.from(selectedModels),
             period_filter: { month: periodMonth, year: periodYear },
           }),
-          // No AbortController — keep alive for as long as it takes
+          signal: abortRef.current.signal,
         }
       )
 
@@ -435,7 +457,7 @@ export default function TestLabPage() {
       }
 
     } catch (e: any) {
-      alert('Benchmark failed: ' + e.message)
+      if (e?.name !== 'AbortError') alert('Benchmark failed: ' + e.message)
     } finally {
       setRunningBench(false)
       _benchInFlight.current = false
@@ -476,8 +498,8 @@ export default function TestLabPage() {
             { n: 2, label: 'Select Parser' },
             { n: 3, label: 'LLM Extract' },
           ] as const).map(({ n, label }, i) => (
-            <>
-              <button key={n}
+            <Fragment key={n}>
+              <button
                 onClick={() => { if (n <= step || (n === 2 && uploadResult)) setStep(n) }}
                 className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-sm font-medium transition-colors ${
                   step === n
@@ -492,7 +514,7 @@ export default function TestLabPage() {
                 {label}
               </button>
               {i < 2 && <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />}
-            </>
+            </Fragment>
           ))}
           {uploadResult && (
             <div className="ml-auto flex items-center gap-1.5 text-xs text-gray-500 bg-gray-50 border border-gray-200 px-3 py-1 rounded-lg">
