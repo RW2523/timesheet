@@ -58,16 +58,43 @@ class OCRService:
         self._paddle = None
         self._paddle_init_attempted = False
 
+    def _try_fusion(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
+        """Run OCR+VLM fusion; return a normalized result dict or None to fall back."""
+        try:
+            from app.services.ocr_vlm_fusion_service import OcrVlmFusionService
+            fr = OcrVlmFusionService().process(
+                path, ext, max_pages=getattr(settings, "OCR_MAX_PAGES", 25))
+            if not (fr.get("raw_text") or "").strip():
+                logger.info("fusion produced no text — falling back to flat OCR")
+                return None
+            return {
+                "raw_text": fr.get("raw_text"),
+                "raw_tables": fr.get("raw_tables"),
+                "confidence": fr.get("confidence", 0.9),
+                "method": "ocr_vlm_fusion",
+                "warnings": fr.get("warnings", []),
+            }
+        except Exception as exc:
+            logger.warning("fusion failed (%s) — falling back to flat OCR", exc)
+            return None
+
     def process(self, file_record: UploadedFile, prior_result: Dict[str, Any]) -> Dict[str, Any]:
         """Run OCR on scanned PDF or image. Updates the RawExtraction record."""
         path = file_record.stored_file_path
         ext = (file_record.file_ext or "").lower()
 
         try:
-            if ext == ".pdf":
-                result = self._ocr_pdf(path)
-            else:
-                result = self._ocr_image(path)
+            result = None
+            # OCR + VLM fusion (opt-in): grounds a VLM on OCR text to rebuild
+            # table structure, and yields raw_tables the flat OCR path can't.
+            if getattr(settings, "PIPELINE_USE_FUSION", False):
+                result = self._try_fusion(path, ext)
+
+            if result is None:
+                if ext == ".pdf":
+                    result = self._ocr_pdf(path)
+                else:
+                    result = self._ocr_image(path)
 
             # Classify OCR'd document type
             doc_classification = _classify_document(result.get("raw_text") or "")
@@ -86,12 +113,16 @@ class OCRService:
                 raw.confidence = result.get("confidence")
                 raw.extraction_method = f"{raw.extraction_method}+{result.get('method', 'ocr')}"
                 raw.extraction_warnings = (raw.extraction_warnings or []) + (result.get("warnings") or [])
+                # Fusion produces real tables — keep them so the normalizer can map columns.
+                if result.get("raw_tables"):
+                    raw.raw_tables = result.get("raw_tables")
             else:
                 raw = RawExtraction(
                     id=gen_uuid(),
                     file_id=file_record.id,
                     extraction_method=result.get("method", "ocr"),
                     raw_text=result.get("raw_text"),
+                    raw_tables=result.get("raw_tables"),
                     confidence=result.get("confidence"),
                     extraction_warnings=result.get("warnings"),
                 )

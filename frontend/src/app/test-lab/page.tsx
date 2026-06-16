@@ -22,8 +22,9 @@ interface UploadResult {
 interface ParserResult {
   parser: string; status: 'success'|'error'; duration_ms: number
   text: string; text_chars: number; tables: number; error?: string
-  vlm_entries?: any[]; page_results?: Array<{page: number; status: string; chars?: number; lines?: number; duration_ms?: number; preview?: string; error?: string}>
+  vlm_entries?: any[]; page_results?: Array<{page: number; status: string; chars?: number; lines?: number; duration_ms?: number; preview?: string; error?: string; ocr_engine?: string; ocr_chars?: number; ocr_confidence?: number; fused_chars?: number}>
   pages_processed?: number; model?: string; errors?: string[]; vlm_summary?: string
+  ocr_text?: string; fusion_summary?: string; warnings?: string[]
 }
 interface LLMResult {
   status: 'success'|'error'|'skipped'|'warning'; duration_ms: number
@@ -642,6 +643,12 @@ export default function TestLabPage() {
               </div>
             )}
 
+            {/* OCR + VLM fusion diagnostic: raw OCR transcript ↔ fused Markdown */}
+            {viewingParser && parserResults[viewingParser]?.status === 'success'
+              && parserResults[viewingParser].ocr_text !== undefined && (
+              <FusionDiagnostic result={parserResults[viewingParser]} />
+            )}
+
             {/* Bottom send button */}
             {selectedResult?.status === 'success' && (
               <div className="flex justify-end pt-2">
@@ -851,6 +858,79 @@ function PeriodBadge({ month, year, onEdit }: { month: number; year: number; onE
       📅 {MONTH_NAMES[month - 1]} {year}
       <span className="text-indigo-400 text-[10px]">✎</span>
     </button>
+  )
+}
+
+// ── OCR + VLM fusion diagnostic ─────────────────────────────────────────────────
+
+function FusionDiagnostic({ result }: { result: ParserResult }) {
+  const pages = (result.page_results || []).filter(p => p.ocr_engine || p.ocr_chars !== undefined)
+  return (
+    <div className="bg-white border border-indigo-200 rounded-2xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-indigo-100 bg-indigo-50">
+        <div className="text-sm font-semibold text-indigo-900">OCR + VLM fusion — correlation</div>
+        <div className="text-xs text-indigo-700 mt-0.5">
+          OCR extracts accurate characters; the VLM rebuilds table layout grounded on that text.
+          {result.model && <> · model <span className="font-mono">{result.model}</span></>}
+        </div>
+      </div>
+
+      {pages.length > 0 && (
+        <div className="px-4 py-3 border-b border-gray-100 overflow-x-auto">
+          <table className="w-full text-xs text-gray-600">
+            <thead>
+              <tr className="text-left text-gray-400">
+                <th className="pr-4 font-medium">Page</th>
+                <th className="pr-4 font-medium">OCR engine</th>
+                <th className="pr-4 font-medium">OCR chars</th>
+                <th className="pr-4 font-medium">OCR conf</th>
+                <th className="pr-4 font-medium">Fused chars</th>
+                <th className="pr-4 font-medium">ms</th>
+              </tr>
+            </thead>
+            <tbody>
+              {pages.map((pg) => (
+                <tr key={pg.page} className="border-t border-gray-50">
+                  <td className="pr-4 py-1">{pg.page}</td>
+                  <td className="pr-4 py-1 font-mono">{pg.ocr_engine ?? '—'}</td>
+                  <td className="pr-4 py-1">{pg.ocr_chars?.toLocaleString() ?? '—'}</td>
+                  <td className="pr-4 py-1">{pg.ocr_confidence != null ? pg.ocr_confidence.toFixed(2) : '—'}</td>
+                  <td className="pr-4 py-1">{pg.fused_chars?.toLocaleString() ?? '—'}</td>
+                  <td className="pr-4 py-1">{pg.duration_ms ?? '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-gray-100">
+        <div>
+          <div className="flex items-center justify-between px-4 py-2 bg-gray-50 border-b border-gray-100">
+            <span className="text-xs font-semibold text-gray-700">1 · Raw OCR transcript</span>
+            <CopyButton text={result.ocr_text || ''} />
+          </div>
+          <pre className="text-[11px] text-gray-700 font-mono overflow-auto max-h-80 p-3 whitespace-pre-wrap leading-relaxed">
+            {result.ocr_text || '(no OCR text)'}
+          </pre>
+        </div>
+        <div>
+          <div className="flex items-center justify-between px-4 py-2 bg-emerald-50 border-b border-emerald-100">
+            <span className="text-xs font-semibold text-emerald-800">2 · Fused Markdown (structured)</span>
+            <CopyButton text={result.text || ''} />
+          </div>
+          <pre className="text-[11px] text-gray-800 font-mono overflow-auto max-h-80 p-3 whitespace-pre-wrap leading-relaxed">
+            {result.text || '(no fused output)'}
+          </pre>
+        </div>
+      </div>
+
+      {!!(result.warnings && result.warnings.length) && (
+        <div className="px-4 py-2 border-t border-amber-100 bg-amber-50 text-xs text-amber-800">
+          {result.warnings.join(' · ')}
+        </div>
+      )}
+    </div>
   )
 }
 

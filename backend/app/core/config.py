@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # table structure far better than flat OCR text, at a speed cost.
     DOCLING_OCR: bool = False
 
+    # OCR + VLM fusion: when on, scanned PDFs / images in the main pipeline are
+    # processed by OcrVlmFusionService (OCR text grounds a VLM that rebuilds the
+    # table layout) instead of flat OCR. Slower but preserves table structure.
+    PIPELINE_USE_FUSION: bool = False
+    FUSION_MAX_RENDER_PX: int = 2200   # cap the longest image edge sent to the VLM
+
     # App
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"

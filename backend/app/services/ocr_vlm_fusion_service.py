@@ -134,6 +134,15 @@ class OcrVlmFusionService:
         combined = "\n\n--- PAGE BREAK ---\n\n".join(p for p in fused_parts if p)
         raw_tables = self._markdown_to_tables(combined)
 
+        # Confidence reflects what we actually recovered: a structured table is
+        # worth more than loose text; no text at all is a failure.
+        if raw_tables:
+            confidence = 0.9
+        elif combined.strip():
+            confidence = 0.6
+        else:
+            confidence = 0.0
+
         return {
             "raw_text": combined,
             "raw_tables": raw_tables,
@@ -141,7 +150,7 @@ class OcrVlmFusionService:
             "page_results": page_results,
             "model": model,
             "pages_processed": len(page_images),
-            "confidence": 0.9 if combined.strip() else 0.0,
+            "confidence": confidence,
             "extraction_method": "ocr_vlm_fusion",
             "ocr_required": False,
             "warnings": warnings,
@@ -177,9 +186,17 @@ class OcrVlmFusionService:
     def _image_to_b64(image_path: str) -> str:
         from PIL import Image
         import io
+        max_px = int(getattr(settings, "FUSION_MAX_RENDER_PX", 2200))
         with Image.open(image_path) as img:
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
+            # Downscale very large pages so the VLM payload stays manageable and
+            # the model doesn't choke on huge images (OCR still runs full-res).
+            longest = max(img.size)
+            if max_px and longest > max_px:
+                scale = max_px / longest
+                img = img.resize((max(1, int(img.width * scale)),
+                                  max(1, int(img.height * scale))))
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return base64.b64encode(buf.getvalue()).decode()
