@@ -13,6 +13,10 @@ storage/reports/*
 !storage/extracted/.gitkeep
 !storage/raw_extractions/.gitkeep
 !storage/reports/.gitkeep
+# Local ML model artifacts (large binaries, downloaded at runtime)
+storage/docling_models/
+# Scratch / debug log files
+storage/*.txt
 *.egg-info/
 dist/
 build/
