@@ -78,12 +78,8 @@ class OCRService:
         )
         return round(score, 2)
 
-    def _multi_engine(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
-        """Run flat OCR, OCR+VLM fusion, and VLM-only; score each; keep the best.
-
-        This is the 'process all three ways and return a single best case' path
-        for image-based files.
-        """
+    def _run_three(self, path: str, ext: str) -> Dict[str, Dict[str, Any]]:
+        """Run flat OCR, OCR+VLM fusion and VLM-only on a single pdf/image input."""
         engines: Dict[str, Dict[str, Any]] = {}
 
         # 1. Flat OCR (PaddleOCR/Tesseract) — accurate chars, no structure
@@ -127,6 +123,55 @@ class OCRService:
         except Exception as exc:
             logger.warning("multi-engine: VLM failed: %s", exc)
             engines["vlm"] = {"raw_text": "", "raw_tables": None, "confidence": 0.0, "error": str(exc)}
+
+        return engines
+
+    @staticmethod
+    def _merge_engines(per_image: List[Dict[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+        """Merge per-image engine results (multi-image DOCX) into one set per engine."""
+        merged: Dict[str, Dict[str, Any]] = {}
+        for key in ("ocr", "ocr_vlm", "vlm"):
+            texts, tables, confs = [], [], []
+            for img in per_image:
+                e = img.get(key) or {}
+                if e.get("raw_text"):
+                    texts.append(e["raw_text"])
+                if e.get("raw_tables"):
+                    tables.extend(e["raw_tables"])
+                confs.append(e.get("confidence") or 0.0)
+            merged[key] = {
+                "raw_text": "\n\n--- IMAGE BREAK ---\n\n".join(texts),
+                "raw_tables": tables or None,
+                "confidence": (sum(confs) / len(confs)) if confs else 0.0,
+                "warnings": [],
+            }
+        return merged
+
+    def _multi_engine(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
+        """Run flat OCR, OCR+VLM fusion, and VLM-only; score each; keep the best.
+
+        Handles image-based files: scanned PDFs, images, and image-only DOCX
+        (embedded images are extracted first, then each is run through the engines).
+        """
+        import shutil, tempfile
+
+        cleanup_dir = None
+        try:
+            if ext in (".docx", ".doc"):
+                from app.services.parsers.docx_parser import DocxParser
+                cleanup_dir = tempfile.mkdtemp(prefix="docx_me_")
+                imgs = DocxParser.extract_embedded_images(path, dest_dir=cleanup_dir)
+                if not imgs:
+                    logger.info("multi-engine: no embedded images in DOCX — falling back")
+                    return None
+                logger.info("multi-engine: DOCX has %d embedded image(s)", len(imgs))
+                per_image = [self._run_three(ip, os.path.splitext(ip)[1].lower()) for ip in imgs]
+                engines = self._merge_engines(per_image)
+            else:
+                engines = self._run_three(path, ext)
+        finally:
+            if cleanup_dir:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
 
         scores = {k: self._score_extraction(v) for k, v in engines.items()}
         best_key = max(scores, key=lambda k: scores[k])

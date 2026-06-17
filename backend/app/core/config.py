@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     # table layout) instead of flat OCR. Slower but preserves table structure.
     PIPELINE_USE_FUSION: bool = False
     FUSION_MAX_RENDER_PX: int = 2200   # cap the longest image edge sent to the VLM
+    FUSION_MIN_OCR_PX: int = 1600      # upscale small/low-res images to at least this before OCR
+
+    # Sanity: a single day cannot plausibly exceed this many hours. Entries above
+    # it are flagged IMPLAUSIBLE_HOURS and excluded so totals/calendar stay clean.
+    MAX_PLAUSIBLE_DAILY_HOURS: float = 24.0
 
     # Multi-engine extraction for IMAGE-BASED files (scanned PDFs + images):
     # run all three engines (flat OCR, OCR+VLM fusion, VLM-only), score each,

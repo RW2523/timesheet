@@ -241,6 +241,25 @@ class TimesheetService:
             # Deterministic hour calculation
             calculated_hours, calc_method = self._calculate_hours(in_time, out_time, break_min, entered_hours)
 
+            # Sanity guard: a day cannot plausibly exceed ~24h. A value above the
+            # cap is a misread column (e.g. an ID read as hours) — flag and drop the
+            # entry so it doesn't poison totals / the calendar.
+            cap = float(getattr(settings, "MAX_PLAUSIBLE_DAILY_HOURS", 24.0))
+            day_max = max(float(entered_hours or 0), float(calculated_hours or 0))
+            if day_max > cap:
+                self._add_validation_error(
+                    batch_id=batch_id,
+                    file_id=file_record.id,
+                    submission_id=submission.id,
+                    employee_id=file_record.matched_employee_id,
+                    rule_code="IMPLAUSIBLE_HOURS",
+                    severity="ERROR",
+                    message=f"{work_date}: {day_max:.1f}h exceeds plausible daily max "
+                            f"{cap:.0f}h — likely a misread value; entry excluded",
+                    actual_value=str(day_max),
+                )
+                continue
+
             # Detect mismatch between entered and calculated hours
             has_mismatch = (
                 entered_hours is not None and calculated_hours is not None

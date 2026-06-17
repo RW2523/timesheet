@@ -183,20 +183,46 @@ class OcrVlmFusionService:
         return out
 
     @staticmethod
+    def _preprocess_to_temp(image_path: str):
+        """Enhance a low-quality scan for OCR: grayscale, autocontrast, and upscale
+        small images. Returns (path, is_temp); falls back to the original on error."""
+        from PIL import Image, ImageOps
+        try:
+            with Image.open(image_path) as im:
+                g = ImageOps.autocontrast(im.convert("L"))
+                min_edge = int(getattr(settings, "FUSION_MIN_OCR_PX", 1600))
+                longest = max(g.size)
+                if min_edge and longest < min_edge:
+                    s = min_edge / longest
+                    g = g.resize((max(1, int(g.width * s)), max(1, int(g.height * s))))
+                fd, tmp = tempfile.mkstemp(suffix="_pp.png")
+                os.close(fd)
+                g.save(tmp)
+                return tmp, True
+        except Exception as exc:
+            logger.warning("fusion: preprocess failed (%s) — using original", exc)
+            return image_path, False
+
+    @staticmethod
     def _image_to_b64(image_path: str) -> str:
-        from PIL import Image
+        from PIL import Image, ImageOps
         import io
         max_px = int(getattr(settings, "FUSION_MAX_RENDER_PX", 2200))
+        min_px = int(getattr(settings, "FUSION_MIN_OCR_PX", 1600))
         with Image.open(image_path) as img:
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
-            # Downscale very large pages so the VLM payload stays manageable and
-            # the model doesn't choke on huge images (OCR still runs full-res).
+            img = ImageOps.autocontrast(img)
             longest = max(img.size)
+            # Upscale tiny/low-res pages so the VLM can read small table fonts…
+            if min_px and longest < min_px:
+                scale = min_px / longest
+                img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
+                longest = max(img.size)
+            # …and downscale very large ones so the payload stays manageable.
             if max_px and longest > max_px:
                 scale = max_px / longest
-                img = img.resize((max(1, int(img.width * scale)),
-                                  max(1, int(img.height * scale))))
+                img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return base64.b64encode(buf.getvalue()).decode()
@@ -209,11 +235,19 @@ class OcrVlmFusionService:
         Tries PaddleOCR (keeps bounding boxes) then Tesseract (image_to_data).
         Boxes are clustered into rows so the transcript keeps reading order.
         """
-        boxes = self._paddle_boxes(image_path)
-        engine = "paddleocr"
-        if not boxes:
-            boxes = self._tesseract_boxes(image_path)
-            engine = "tesseract"
+        pp_path, is_temp = self._preprocess_to_temp(image_path)
+        try:
+            boxes = self._paddle_boxes(pp_path)
+            engine = "paddleocr"
+            if not boxes:
+                boxes = self._tesseract_boxes(pp_path)
+                engine = "tesseract"
+        finally:
+            if is_temp:
+                try:
+                    os.remove(pp_path)
+                except OSError:
+                    pass
         if not boxes:
             return "", "none", 0.0
 

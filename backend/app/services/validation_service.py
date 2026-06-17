@@ -55,6 +55,16 @@ SEVERITY_ERROR = "ERROR"
 SEVERITY_WARNING = "WARNING"
 SEVERITY_INFO = "INFO"
 
+# Rule codes this service generates and re-generates on every run. Only these
+# are wiped before re-validation; entry-level codes from TimesheetService
+# (IMPLAUSIBLE_HOURS, INVALID_DATE, DAILY_HOURS_MISMATCH, …) are preserved.
+_VALIDATION_OWNED_CODES = {
+    "EMPLOYEE_NOT_MATCHED", "EXTRACTION_FAILED", "NON_TIMESHEET_DOCUMENT",
+    "DAILY_HOURS_EXCEED", "DAILY_REGULAR_LIMIT_EXCEEDED", "WEEKLY_HOURS_EXCEED",
+    "HOURS_TOTAL_MISMATCH", "MISSING_APPROVAL", "MISSING_RATE", "LATE_SUBMISSION",
+    "HOLIDAY_WORK", "MISSING_TIMESHEET", "TWO_MONTH_INACTIVE",
+}
+
 
 class ValidationService:
     def __init__(self, db: Session):
@@ -66,11 +76,15 @@ class ValidationService:
         Clears all auto-generated OPEN errors first so re-runs don't accumulate stale
         duplicates. Manually-RESOLVED errors are preserved as audit history.
         """
-        # Wipe stale OPEN errors — they'll be freshly re-generated below.
+        # Wipe stale OPEN errors — but ONLY the codes THIS service regenerates.
+        # Entry-level codes raised during submission creation (IMPLAUSIBLE_HOURS,
+        # INVALID_DATE, DAILY_HOURS_MISMATCH, OVERLAPPING_DATE_CONFLICT, …) must be
+        # preserved, otherwise they'd be erased on every re-validation.
         # RESOLVED errors are audit records and must not be deleted.
         self.db.query(ValidationError).filter(
             ValidationError.batch_id == batch_id,
             ValidationError.status == "OPEN",
+            ValidationError.rule_code.in_(_VALIDATION_OWNED_CODES),
         ).delete(synchronize_session=False)
         self.db.flush()
 
