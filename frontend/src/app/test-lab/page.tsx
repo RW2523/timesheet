@@ -1204,6 +1204,8 @@ function V2ResultView({ v2 }: { v2: V2Result }) {
           <MonthCalendar
             entries={v2ToDayEntries(v2.daily_records)}
             name={v2.employee_name || 'Timesheet'}
+            periodStart={v2.period?.start_date}
+            periodEnd={v2.period?.end_date}
             subtitle={`${v2.daily_records.filter(r => r.worked).length} worked day(s) · ${v2.summary?.total_payable_hours ?? 0}h payable`}
           />
         )}

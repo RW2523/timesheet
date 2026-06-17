@@ -58,6 +58,102 @@ class OCRService:
         self._paddle = None
         self._paddle_init_attempted = False
 
+    @staticmethod
+    def _score_extraction(r: Dict[str, Any]) -> float:
+        """Quality score for an engine's output — rewards real table structure
+        and timesheet signal (dates) over loose text. Used to pick the best of
+        the three image-based engines."""
+        text = (r.get("raw_text") or "")
+        if not text.strip():
+            return 0.0
+        tables = r.get("raw_tables") or []
+        table_rows = sum(len(t.get("rows") or []) for t in tables)
+        date_hits = len(re.findall(
+            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b", text))
+        score = (
+            table_rows * 2.0
+            + date_hits * 1.0
+            + min(len(text) / 500.0, 8.0)
+            + float(r.get("confidence") or 0.0) * 3.0
+        )
+        return round(score, 2)
+
+    def _multi_engine(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
+        """Run flat OCR, OCR+VLM fusion, and VLM-only; score each; keep the best.
+
+        This is the 'process all three ways and return a single best case' path
+        for image-based files.
+        """
+        engines: Dict[str, Dict[str, Any]] = {}
+
+        # 1. Flat OCR (PaddleOCR/Tesseract) — accurate chars, no structure
+        try:
+            ocr = self._ocr_pdf(path) if ext == ".pdf" else self._ocr_image(path)
+            engines["ocr"] = {
+                "raw_text": ocr.get("raw_text") or "", "raw_tables": None,
+                "confidence": ocr.get("confidence") or 0.0,
+                "warnings": ocr.get("warnings") or [],
+            }
+        except Exception as exc:
+            logger.warning("multi-engine: flat OCR failed: %s", exc)
+            engines["ocr"] = {"raw_text": "", "raw_tables": None, "confidence": 0.0, "error": str(exc)}
+
+        # 2. OCR + VLM fusion — OCR-grounded VLM rebuilds the table layout
+        try:
+            from app.services.ocr_vlm_fusion_service import OcrVlmFusionService
+            fr = OcrVlmFusionService().process(
+                path, ext, max_pages=getattr(settings, "OCR_MAX_PAGES", 25))
+            engines["ocr_vlm"] = {
+                "raw_text": fr.get("raw_text") or "", "raw_tables": fr.get("raw_tables"),
+                "confidence": fr.get("confidence") or 0.0,
+                "warnings": fr.get("warnings") or [],
+            }
+        except Exception as exc:
+            logger.warning("multi-engine: fusion failed: %s", exc)
+            engines["ocr_vlm"] = {"raw_text": "", "raw_tables": None, "confidence": 0.0, "error": str(exc)}
+
+        # 3. VLM-only — vision model transcribes the page image directly
+        try:
+            from app.services.vlm_service import VLMService
+            vlm = VLMService()
+            vr = (vlm.read_text_from_pdf(path, max_pages=getattr(settings, "OCR_MAX_PAGES", 25))
+                  if ext == ".pdf" else vlm.read_text_from_image(path, ext))
+            vtext = vr.get("raw_text") or ""
+            engines["vlm"] = {
+                "raw_text": vtext, "raw_tables": None,
+                "confidence": 0.7 if vtext.strip() else 0.0,
+                "warnings": vr.get("errors") or [],
+            }
+        except Exception as exc:
+            logger.warning("multi-engine: VLM failed: %s", exc)
+            engines["vlm"] = {"raw_text": "", "raw_tables": None, "confidence": 0.0, "error": str(exc)}
+
+        scores = {k: self._score_extraction(v) for k, v in engines.items()}
+        best_key = max(scores, key=lambda k: scores[k])
+        best = engines[best_key]
+        if not (best.get("raw_text") or "").strip():
+            logger.info("multi-engine: all engines empty — falling back to flat OCR")
+            return None
+
+        score_summary = ", ".join(f"{k}={scores[k]}" for k in ("ocr", "ocr_vlm", "vlm"))
+        logger.info("multi-engine: scores [%s] → best=%s", score_summary, best_key)
+
+        return {
+            "raw_text": best["raw_text"],
+            "raw_tables": best.get("raw_tables"),
+            "confidence": best.get("confidence") or 0.0,
+            "method": f"multiengine:{best_key}",
+            "warnings": (best.get("warnings") or []) + [f"multi-engine scores: {score_summary}"],
+            "engine_results": {
+                k: {"chars": len(v.get("raw_text") or ""),
+                    "tables": len(v.get("raw_tables") or []),
+                    "score": scores[k],
+                    "error": v.get("error")}
+                for k, v in engines.items()
+            },
+            "best_engine": best_key,
+        }
+
     def _try_fusion(self, path: str, ext: str) -> Optional[Dict[str, Any]]:
         """Run OCR+VLM fusion; return a normalized result dict or None to fall back."""
         try:
@@ -85,9 +181,12 @@ class OCRService:
 
         try:
             result = None
-            # OCR + VLM fusion (opt-in): grounds a VLM on OCR text to rebuild
+            # Multi-engine (default): run OCR, OCR+VLM fusion and VLM, keep best.
+            if getattr(settings, "PIPELINE_MULTIENGINE_IMAGES", False):
+                result = self._multi_engine(path, ext)
+            # OCR + VLM fusion only (opt-in): grounds a VLM on OCR text to rebuild
             # table structure, and yields raw_tables the flat OCR path can't.
-            if getattr(settings, "PIPELINE_USE_FUSION", False):
+            elif getattr(settings, "PIPELINE_USE_FUSION", False):
                 result = self._try_fusion(path, ext)
 
             if result is None:

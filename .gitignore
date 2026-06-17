@@ -21,3 +21,7 @@ storage/*.txt
 dist/
 build/
 .DS_Store
+
+# Real timesheet sample data (PII — do not commit)
+Timesheet sample/
+storage/sample_src/

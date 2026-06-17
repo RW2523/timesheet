@@ -34,8 +34,9 @@ function typeStyle(e?: DayEntry, inMonth = true): { bg: string; text: string; la
   return { bg: 'bg-indigo-50 border-indigo-200', text: 'text-indigo-700', label: 'Work' }
 }
 
-export default function MonthCalendar({ entries, name, subtitle, totalHours }:
-  { entries: DayEntry[]; name?: string; subtitle?: string; totalHours?: number }) {
+export default function MonthCalendar({ entries, name, subtitle, totalHours, periodStart, periodEnd }:
+  { entries: DayEntry[]; name?: string; subtitle?: string; totalHours?: number
+    periodStart?: string | null; periodEnd?: string | null }) {
 
   const byDate = useMemo(() => {
     const m = new Map<string, DayEntry>()
@@ -69,6 +70,25 @@ export default function MonthCalendar({ entries, name, subtitle, totalHours }:
     return Math.round(t * 100) / 100
   }, [entries, cy, cm])
 
+  // A weekday inside the timesheet period with no recorded hours is "missing".
+  const inPeriod = (dstr: string) => {
+    if (periodStart && dstr < periodStart) return false
+    if (periodEnd && dstr > periodEnd) return false
+    return true
+  }
+  const missingDays = useMemo(() => {
+    const out = new Set<string>()
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dstr = `${cy}-${String(cm).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+      const dow = new Date(cy, cm - 1, d).getDay()
+      if (dow === 0 || dow === 6) continue                 // weekends aren't "missing"
+      if (!inPeriod(dstr)) continue
+      const e = byDate.get(dstr)
+      if (!e || (e.hours || 0) === 0) out.add(dstr)
+    }
+    return out
+  }, [byDate, cy, cm, daysInMonth, periodStart, periodEnd])
+
   const cells: Array<{ day: number | null; key: string }> = []
   for (let i = 0; i < firstDow; i++) cells.push({ day: null, key: `b${i}` })
   for (let d = 1; d <= daysInMonth; d++) cells.push({ day: d, key: `d${d}` })
@@ -83,6 +103,12 @@ export default function MonthCalendar({ entries, name, subtitle, totalHours }:
           <div className="text-xs text-gray-500">{subtitle || `${MONTHS[cm - 1]} ${cy}`}</div>
         </div>
         <div className="flex items-center gap-3">
+          {missingDays.size > 0 && (
+            <div className="text-right">
+              <div className="text-xs text-gray-400">Missing</div>
+              <div className="text-lg font-bold text-rose-600">{missingDays.size}d</div>
+            </div>
+          )}
           <div className="text-right">
             <div className="text-xs text-gray-400">Month total</div>
             <div className="text-lg font-bold text-indigo-600">{monthTotal}h</div>
@@ -109,19 +135,22 @@ export default function MonthCalendar({ entries, name, subtitle, totalHours }:
             if (c.day === null) return <div key={c.key} className="aspect-square" />
             const dstr = `${cy}-${String(cm).padStart(2, '0')}-${String(c.day).padStart(2, '0')}`
             const e = byDate.get(dstr)
+            const isMissing = missingDays.has(dstr)
             const st = typeStyle(e, true)
             const isSel = selected === dstr
             return (
               <button key={c.key}
                 onClick={() => setSelected(isSel ? null : dstr)}
-                className={`aspect-square rounded-lg border ${st.bg} ${isSel ? 'ring-2 ring-indigo-500' : ''}
-                  flex flex-col items-center justify-center p-1 transition hover:brightness-95 text-center`}>
+                className={`aspect-square rounded-lg border flex flex-col items-center justify-center p-1 transition hover:brightness-95 text-center
+                  ${isMissing ? 'bg-rose-50 border-rose-300 border-dashed' : st.bg} ${isSel ? 'ring-2 ring-indigo-500' : ''}`}>
                 <span className="text-[10px] text-gray-400 self-start leading-none">{c.day}</span>
-                {e ? (
+                {e && (e.hours || 0) > 0 ? (
                   <>
-                    <span className={`text-sm font-bold ${st.text} leading-tight`}>{e.hours || 0}</span>
+                    <span className={`text-sm font-bold ${st.text} leading-tight`}>{e.hours}</span>
                     {st.label && <span className={`text-[9px] ${st.text} leading-none`}>{st.label}</span>}
                   </>
+                ) : isMissing ? (
+                  <span className="text-[9px] text-rose-500 font-medium leading-none">missing</span>
                 ) : <span className="text-[11px] text-gray-200">·</span>}
               </button>
             )
@@ -135,8 +164,8 @@ export default function MonthCalendar({ entries, name, subtitle, totalHours }:
         <Legend cls="bg-amber-200" label="Overtime" />
         <Legend cls="bg-purple-200" label="Leave" />
         <Legend cls="bg-teal-200" label="Holiday" />
-        <Legend cls="bg-rose-200" label="Absent" />
-        <Legend cls="bg-gray-100" label="Off / 0h" />
+        <Legend cls="bg-rose-50 border border-rose-300 border-dashed" label="Missing" />
+        <Legend cls="bg-gray-100" label="Off / weekend" />
       </div>
 
       {/* day detail */}

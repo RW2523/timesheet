@@ -93,7 +93,31 @@ def list_timesheets(batch_id: str, db: Session = Depends(get_db)):
             "entries": days,
         })
     out.sort(key=lambda t: (t["employee_name"] or "z").lower())
-    return {"batch_id": batch_id, "timesheets": out, "count": len(out)}
+
+    # "What is missing": candidate files that produced NO timesheet (extraction gap).
+    sub_file_ids = {s.file_id for s in subs if s.file_id}
+    candidates = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.batch_id == batch_id,
+            UploadedFile.is_noise_file == False,
+            UploadedFile.is_duplicate == False,
+            UploadedFile.is_timesheet_candidate == True,
+        )
+        .all()
+    )
+    missing_files = [
+        {"file_id": f.id, "file_name": f.file_name,
+         "status": f.processing_status, "ext": f.file_ext}
+        for f in candidates if f.id not in sub_file_ids
+    ]
+    return {
+        "batch_id": batch_id,
+        "timesheets": out,
+        "count": len(out),
+        "missing_files": missing_files,
+        "missing_count": len(missing_files),
+    }
 
 
 @router.patch("/entries/{entry_id}")

@@ -19,8 +19,10 @@ def setup_logging() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    # Always keep these noisy libraries quiet regardless of LOG_LEVEL
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # Per-request HTTP access logs: off by default (frontend polls a lot), set
+    # ACCESS_LOG=true (or 1/yes) in the environment to see a line per request.
+    access_on = os.getenv("ACCESS_LOG", "").lower() in ("1", "true", "yes", "on")
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO if access_on else logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("celery").setLevel(logging.INFO)
     logging.getLogger("paddle").setLevel(logging.WARNING)

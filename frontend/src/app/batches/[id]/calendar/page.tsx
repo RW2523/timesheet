@@ -16,6 +16,8 @@ export default function CalendarPage({ params }: Props) {
   })
   const [active, setActive] = useState(0)
   const sheets: TimesheetCal[] = data?.timesheets || []
+  const missing = data?.missing_files || []
+  const totalHours = sheets.reduce((a, s) => a + (s.total_hours || 0), 0)
 
   return (
     <div className="max-w-6xl mx-auto p-6 space-y-5">
@@ -35,6 +37,29 @@ export default function CalendarPage({ params }: Props) {
       {isError && <div className="text-red-600 py-10 text-center">Failed to load timesheets.</div>}
       {!isLoading && !isError && sheets.length === 0 && (
         <div className="text-gray-500 py-16 text-center">No timesheets extracted yet for this batch.</div>
+      )}
+
+      {/* simple summary */}
+      {!isLoading && !isError && (sheets.length > 0 || missing.length > 0) && (
+        <div className="flex flex-wrap gap-3">
+          <Stat label="Timesheets extracted" value={`${sheets.length}`} tone="indigo" />
+          <Stat label="Total hours" value={`${Math.round(totalHours)}h`} tone="indigo" />
+          <Stat label="Not extracted" value={`${missing.length}`} tone={missing.length ? 'rose' : 'gray'} />
+        </div>
+      )}
+
+      {/* what is missing — files that produced no timesheet */}
+      {missing.length > 0 && (
+        <div className="bg-rose-50 border border-rose-200 rounded-xl p-3">
+          <div className="text-sm font-semibold text-rose-800 mb-1">Missing — {missing.length} file(s) had no timesheet extracted</div>
+          <div className="flex flex-wrap gap-2">
+            {missing.map(m => (
+              <span key={m.file_id} className="text-xs bg-white border border-rose-200 text-rose-700 rounded-lg px-2 py-1">
+                {m.file_name} <span className="text-rose-400">· {m.status}</span>
+              </span>
+            ))}
+          </div>
+        </div>
       )}
 
       {sheets.length > 0 && (
@@ -66,12 +91,24 @@ export default function CalendarPage({ params }: Props) {
                 key={sheets[active].submission_id}
                 entries={sheets[active].entries}
                 name={sheets[active].employee_name}
+                periodStart={sheets[active].period_start}
+                periodEnd={sheets[active].period_end}
                 subtitle={`${sheets[active].entries.length} day(s) · ${sheets[active].total_hours}h total · ${sheets[active].matched ? 'employee matched' : 'employee not matched (extracted name)'}`}
               />
             )}
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+function Stat({ label, value, tone }: { label: string; value: string; tone: 'indigo' | 'rose' | 'gray' }) {
+  const c = tone === 'rose' ? 'text-rose-600' : tone === 'gray' ? 'text-gray-500' : 'text-indigo-600'
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl px-4 py-2">
+      <div className="text-xs text-gray-400">{label}</div>
+      <div className={`text-lg font-bold ${c}`}>{value}</div>
     </div>
   )
 }

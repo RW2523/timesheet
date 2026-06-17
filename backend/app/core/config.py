@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     PIPELINE_USE_FUSION: bool = False
     FUSION_MAX_RENDER_PX: int = 2200   # cap the longest image edge sent to the VLM
 
+    # Multi-engine extraction for IMAGE-BASED files (scanned PDFs + images):
+    # run all three engines (flat OCR, OCR+VLM fusion, VLM-only), score each,
+    # and keep the best single result. Text-based files keep their recommended
+    # parser. Most powerful but slowest path. Takes precedence over PIPELINE_USE_FUSION.
+    PIPELINE_MULTIENGINE_IMAGES: bool = True
+
     # App
     APP_ENV: str = "development"
     SECRET_KEY: str = "change-me-in-production"

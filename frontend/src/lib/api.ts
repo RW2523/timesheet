@@ -148,9 +148,11 @@ export interface TimesheetCal {
     in_time?: string | null; out_time?: string | null; break_minutes?: number | null
     regular_hours?: number; overtime_hours?: number }>
 }
+export interface MissingFile { file_id: string; file_name: string; status: string; ext: string }
 export const listTimesheets = async (batchId: string) => {
   const { data } = await http.get(`/batches/${batchId}/timesheets`)
-  return data as { batch_id: string; timesheets: TimesheetCal[]; count: number }
+  return data as { batch_id: string; timesheets: TimesheetCal[]; count: number
+    missing_files: MissingFile[]; missing_count: number }
 }
 
 // ── Validation ────────────────────────────────────────────────────────────────
