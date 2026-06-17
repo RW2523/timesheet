@@ -280,6 +280,9 @@ class TimesheetSubmission(Base):
     batch_id = Column(UUID(as_uuid=False), ForeignKey("batch_uploads.id"))
     file_id = Column(UUID(as_uuid=False), ForeignKey("uploaded_files.id"))
     employee_id = Column(UUID(as_uuid=False), ForeignKey("employees.id"))
+    # Name extracted from the document, kept even when no employee match exists
+    # (matching is optional metadata, not a gate on extraction).
+    detected_employee_name = Column(Text)
     payroll_period_id = Column(UUID(as_uuid=False), ForeignKey("payroll_periods.id"))
     vendor_id = Column(UUID(as_uuid=False), ForeignKey("vendors.id"))
     source_type = Column(Text, nullable=False)
@@ -314,7 +317,8 @@ class TimesheetEntry(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
     submission_id = Column(UUID(as_uuid=False), ForeignKey("timesheet_submissions.id"), nullable=False)
-    employee_id = Column(UUID(as_uuid=False), ForeignKey("employees.id"), nullable=False)
+    # Nullable: a timesheet is fully extracted even when the employee is unmatched.
+    employee_id = Column(UUID(as_uuid=False), ForeignKey("employees.id"))
     work_date = Column(Date, nullable=False)
     day_of_week = Column(String(10))
     in_time = Column(Time)

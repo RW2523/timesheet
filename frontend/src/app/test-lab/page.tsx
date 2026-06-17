@@ -8,8 +8,27 @@ import {
   Layers, AlertTriangle, Play, Send, Download, Cpu, Trophy,
   ChevronDown, ChevronUp,
 } from 'lucide-react'
+import MonthCalendar, { DayEntry } from '@/components/MonthCalendar'
 
 const API = '/api/v1/debug/lab'
+
+// Map the V2 daily records into the calendar's day-entry shape.
+function v2ToDayEntries(records: V2DailyRecord[]): DayEntry[] {
+  return (records || []).filter(r => r.date).map(r => {
+    let entry_type = 'WORK', leave_type: string | null = null
+    if ((r.holiday_hours || 0) > 0) entry_type = 'HOLIDAY'
+    else if ((r.sick_hours || 0) > 0) { entry_type = 'LEAVE'; leave_type = 'Sick' }
+    else if ((r.vacation_hours || 0) > 0) { entry_type = 'LEAVE'; leave_type = 'Vacation' }
+    else if (!r.worked || (r.total_hours || 0) === 0) entry_type = 'WEEKEND'
+    return {
+      date: r.date, hours: r.total_hours || 0,
+      regular_hours: r.regular_hours, overtime_hours: r.overtime_hours,
+      entry_type, leave_type,
+      in_time: r.in_time, out_time: r.out_time,
+      break_minutes: r.lunch_hours ? Math.round(r.lunch_hours * 60) : 0,
+    }
+  })
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 interface ParserDef { id: string; name: string; desc: string; category: string }
@@ -1072,7 +1091,7 @@ function PdfTypeBadge({ data }: { data: any }) {
 
 // ── V2 Schema Renderer ────────────────────────────────────────────────────────
 function V2ResultView({ v2 }: { v2: V2Result }) {
-  const [tab, setTab] = useState<'daily'|'overtime'|'validation'|'approval'|'ignored'>('daily')
+  const [tab, setTab] = useState<'daily'|'calendar'|'overtime'|'validation'|'approval'|'ignored'>('daily')
   const s   = v2.summary
   const ot  = v2.overtime
   const val = v2.validation
@@ -1138,7 +1157,7 @@ function V2ResultView({ v2 }: { v2: V2Result }) {
 
       {/* Sub-tabs */}
       <div className="flex border-b bg-gray-50 text-sm">
-        {([['daily','Daily Records'],['overtime','Overtime'],['validation','Validation'],['approval','Approval'],['ignored','Ignored Dates']] as const).map(([id, label]) => (
+        {([['daily','Daily Records'],['calendar','Calendar'],['overtime','Overtime'],['validation','Validation'],['approval','Approval'],['ignored','Ignored Dates']] as const).map(([id, label]) => (
           <button key={id} onClick={() => setTab(id)}
             className={`px-4 py-2 font-medium transition-colors ${
               tab === id ? 'border-b-2 border-indigo-600 text-indigo-600 bg-white' : 'text-gray-500 hover:text-gray-700'
@@ -1181,6 +1200,13 @@ function V2ResultView({ v2 }: { v2: V2Result }) {
           ) : <p className="text-sm text-gray-400 text-center py-6">No daily records</p>
         )}
 
+        {tab === 'calendar' && (
+          <MonthCalendar
+            entries={v2ToDayEntries(v2.daily_records)}
+            name={v2.employee_name || 'Timesheet'}
+            subtitle={`${v2.daily_records.filter(r => r.worked).length} worked day(s) · ${v2.summary?.total_payable_hours ?? 0}h payable`}
+          />
+        )}
         {tab === 'overtime' && (
           <div className="grid grid-cols-2 gap-3">
             {[

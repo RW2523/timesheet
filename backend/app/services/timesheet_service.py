@@ -34,14 +34,17 @@ class TimesheetService:
         self.db = db
 
     def create_submissions_for_batch(self, batch_id: str) -> None:
-        """Create timesheet submissions and entries for all matched files in a batch."""
+        """Create timesheet submissions and entries for every candidate file.
+
+        Employee matching is optional metadata, NOT a gate: a file's structured
+        timesheet is created whether or not it matched an employee in the roster.
+        """
         files = (
             self.db.query(UploadedFile)
             .filter(
                 UploadedFile.batch_id == batch_id,
                 UploadedFile.is_noise_file == False,
                 UploadedFile.is_duplicate == False,
-                UploadedFile.matched_employee_id.isnot(None),
                 UploadedFile.is_timesheet_candidate == True,
             )
             .all()
@@ -319,8 +322,10 @@ class TimesheetService:
         file_record.updated_at = datetime.utcnow()
         self.db.commit()
 
-    def _get_vendor(self, employee_id: str) -> Optional[Vendor]:
-        """Fetch vendor for employee."""
+    def _get_vendor(self, employee_id: Optional[str]) -> Optional[Vendor]:
+        """Fetch vendor for employee (None when unmatched)."""
+        if not employee_id:
+            return None
         emp = self.db.query(Employee).filter(Employee.id == employee_id).first()
         if emp and emp.vendor_id:
             return self.db.query(Vendor).filter(Vendor.id == emp.vendor_id).first()
@@ -343,6 +348,22 @@ class TimesheetService:
         - If payroll_period_id exists, find by employee + payroll_period.
         - Otherwise find by employee + batch (merge all files for same employee in batch).
         """
+        # Unmatched files can't be merged by employee (employee_id is None for all
+        # of them) — key the submission by file so each document gets its own.
+        if not employee_id:
+            existing_file = (
+                self.db.query(TimesheetSubmission)
+                .filter(TimesheetSubmission.file_id == file_id)
+                .first()
+            )
+            if existing_file:
+                return existing_file
+            return self._new_submission(
+                employee_id=None, file_id=file_id, batch_id=batch_id,
+                payroll_period_id=payroll_period_id, period_start=period_start,
+                period_end=period_end, extracted=extracted, vendor=vendor,
+            )
+
         # Primary: find by payroll period
         if payroll_period_id:
             existing = (
@@ -378,14 +399,24 @@ class TimesheetService:
                 existing_any.timesheet_end_date = period_end
             return existing_any
 
-        vendor_id = vendor.id if vendor else None
+        return self._new_submission(
+            employee_id=employee_id, file_id=file_id, batch_id=batch_id,
+            payroll_period_id=payroll_period_id, period_start=period_start,
+            period_end=period_end, extracted=extracted, vendor=vendor,
+        )
+
+    def _new_submission(
+        self, employee_id, file_id, batch_id, payroll_period_id,
+        period_start, period_end, extracted, vendor,
+    ) -> TimesheetSubmission:
         sub = TimesheetSubmission(
             id=gen_uuid(),
             batch_id=batch_id,
             file_id=file_id,
             employee_id=employee_id,
+            detected_employee_name=(extracted.get("employee_name") or None),
             payroll_period_id=payroll_period_id,
-            vendor_id=vendor_id,
+            vendor_id=vendor.id if vendor else None,
             source_type="ZIP_UPLOAD",
             submission_date=datetime.utcnow(),
             timesheet_start_date=period_start,

@@ -12,6 +12,7 @@ interface Props { params: { id: string } }
 
 const TABS = [
   { key: 'files', label: 'Files', icon: FileText, href: (id: string) => `/batches/${id}/files` },
+  { key: 'calendar', label: 'Calendar', icon: Calendar, href: (id: string) => `/batches/${id}/calendar` },
   { key: 'validation', label: 'Validation Issues', icon: AlertTriangle, href: (id: string) => `/batches/${id}/validation` },
   { key: 'approvals', label: 'Approvals', icon: CheckCircle2, href: (id: string) => `/batches/${id}/approvals` },
   { key: 'reports', label: 'Reports', icon: Download, href: (id: string) => `/batches/${id}/reports` },

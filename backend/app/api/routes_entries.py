@@ -31,6 +31,71 @@ def list_entries(
     return EntryListResponse(items=items, total=total)
 
 
+@router.get("/batches/{batch_id}/timesheets")
+def list_timesheets(batch_id: str, db: Session = Depends(get_db)):
+    """Per-submission timesheets with day-level hours — powers the calendar view.
+
+    Returns one entry per processed file (matched or not), each with its
+    extracted/known employee name, period, monthly total and day records.
+    """
+    from app.db.models import TimesheetSubmission, Employee, UploadedFile
+
+    subs = (
+        db.query(TimesheetSubmission)
+        .filter(TimesheetSubmission.batch_id == batch_id)
+        .all()
+    )
+    out = []
+    for s in subs:
+        emp = db.query(Employee).filter(Employee.id == s.employee_id).first() if s.employee_id else None
+        fname = None
+        if s.file_id:
+            uf = db.query(UploadedFile).filter(UploadedFile.id == s.file_id).first()
+            fname = uf.file_name if uf else None
+
+        entries = (
+            db.query(TimesheetEntry)
+            .filter(TimesheetEntry.submission_id == s.id)
+            .order_by(TimesheetEntry.work_date)
+            .all()
+        )
+        days = []
+        total = 0.0
+        for e in entries:
+            reg = float(e.regular_hours or 0)
+            ot = float(e.overtime_hours or 0)
+            hrs = reg + ot
+            if hrs == 0:
+                hrs = float(e.calculated_hours or e.entered_hours or 0)
+            total += hrs
+            days.append({
+                "date": e.work_date.isoformat() if e.work_date else None,
+                "day_of_week": e.day_of_week,
+                "hours": round(hrs, 2),
+                "regular_hours": reg,
+                "overtime_hours": ot,
+                "entry_type": e.entry_type,
+                "leave_type": e.leave_type,
+                "in_time": str(e.in_time) if e.in_time else None,
+                "out_time": str(e.out_time) if e.out_time else None,
+                "break_minutes": e.break_minutes,
+            })
+        out.append({
+            "submission_id": s.id,
+            "file_id": s.file_id,
+            "file_name": fname,
+            "employee_name": (emp.full_name if emp else None) or s.detected_employee_name or "Unknown",
+            "matched": bool(s.employee_id),
+            "period_start": s.timesheet_start_date.isoformat() if s.timesheet_start_date else None,
+            "period_end": s.timesheet_end_date.isoformat() if s.timesheet_end_date else None,
+            "total_hours": round(total, 2),
+            "approval_status": s.approval_status,
+            "entries": days,
+        })
+    out.sort(key=lambda t: (t["employee_name"] or "z").lower())
+    return {"batch_id": batch_id, "timesheets": out, "count": len(out)}
+
+
 @router.patch("/entries/{entry_id}")
 def update_entry(
     entry_id: str,

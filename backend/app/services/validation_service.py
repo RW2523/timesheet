@@ -128,14 +128,16 @@ class ValidationService:
                 .first()
             )
             if not existing:
+                # Matching is optional metadata, not a gate: the timesheet is still
+                # fully extracted. Flag as a non-blocking WARNING for later linking.
                 self._add_error(
                     batch_id=batch_id,
                     file_id=f.id,
                     rule_code="EMPLOYEE_NOT_MATCHED",
-                    severity=SEVERITY_BLOCKER,
+                    severity=SEVERITY_WARNING,
                     message=f"No employee matched for file '{f.file_name}' "
                             f"(candidate: '{f.detected_employee_name or 'unknown'}')",
-                    action_required="Manually match employee or rename file with employee name",
+                    action_required="Optionally link to an employee in the roster",
                     assigned_to_role="HR",
                 )
 

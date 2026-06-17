@@ -139,6 +139,20 @@ export const listEntries = async (batchId: string, params?: { skip?: number; lim
   return data as { items: TimesheetEntry[]; total: number }
 }
 
+export interface TimesheetCal {
+  submission_id: string; file_id: string | null; file_name: string | null
+  employee_name: string; matched: boolean
+  period_start: string | null; period_end: string | null; total_hours: number
+  approval_status: string
+  entries: Array<{ date: string; hours: number; entry_type?: string; leave_type?: string | null
+    in_time?: string | null; out_time?: string | null; break_minutes?: number | null
+    regular_hours?: number; overtime_hours?: number }>
+}
+export const listTimesheets = async (batchId: string) => {
+  const { data } = await http.get(`/batches/${batchId}/timesheets`)
+  return data as { batch_id: string; timesheets: TimesheetCal[]; count: number }
+}
+
 // ── Validation ────────────────────────────────────────────────────────────────
 
 export const listValidation = async (
